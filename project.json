@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "AI办公搭子",
+  "ports": {
+    "backend": 8040,
+    "frontend": 3040
+  }
+}

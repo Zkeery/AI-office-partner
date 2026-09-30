@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from collections.abc import Generator
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.db.models import Base, make_engine, make_session_factory
+
+_settings = get_settings()
+_settings.data_path.mkdir(parents=True, exist_ok=True)
+_settings.uploads_path.mkdir(parents=True, exist_ok=True)
+_settings.artifacts_path.mkdir(parents=True, exist_ok=True)
+
+engine = make_engine(f"sqlite:///{_settings.db_path}")
+SessionLocal = make_session_factory(engine)
+
+
+def _ensure_schedule_columns() -> None:
+    """SQLite create_all 不补已有表列；为 1.22 事件触发补列。"""
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(schedules)")).fetchall()
+        if not rows:
+            return
+        cols = {r[1] for r in rows}
+        if "trigger_mode" not in cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE schedules ADD COLUMN trigger_mode VARCHAR(40) "
+                    "NOT NULL DEFAULT 'interval'"
+                )
+            )
+        if "listen_schedule_id" not in cols:
+            conn.execute(
+                text("ALTER TABLE schedules ADD COLUMN listen_schedule_id VARCHAR(36)")
+            )
+        if "hook_token" not in cols:
+            conn.execute(
+                text("ALTER TABLE schedules ADD COLUMN hook_token VARCHAR(128)")
+            )
+        if "feishu_notify" not in cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE schedules ADD COLUMN feishu_notify BOOLEAN "
+                    "NOT NULL DEFAULT 0"
+                )
+            )
+        if "feishu_notify_chat_id" not in cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE schedules ADD COLUMN feishu_notify_chat_id VARCHAR(128)"
+                )
+            )
+
+
+def init_db() -> None:
+    Base.metadata.create_all(bind=engine)
+    _ensure_schedule_columns()
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

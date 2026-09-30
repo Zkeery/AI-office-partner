@@ -1,0 +1,14 @@
+{
+  "name": "ai-office-buddy-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI办公搭子桌面壳（Electron）",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}

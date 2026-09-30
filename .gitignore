@@ -1,0 +1,46 @@
+# 密钥与本地环境（勿提交真实 .env）
+.env
+.env.*
+!.env.example
+!.env.blueprint.example
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+.blueprint-venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# 运行时数据与本地状态（任务、资料库、OAuth token、偏好等）
+data/
+backend/data/
+.runtime/
+logs/
+*.log
+
+# 飞书本地凭证 / 偏好（通常已在 data/；显式忽略防误放）
+**/feishu_user_oauth.json
+**/feishu_oauth_pending.json
+**/feishu_notify_prefs.json
+**/feishu_notify_log.json
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

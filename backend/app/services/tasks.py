@@ -1,0 +1,1067 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import shutil
+import uuid
+from datetime import timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from app.core.config import Settings, get_settings
+from app.core.errors import AppError
+from app.db.models import Task, TaskEvent, TaskStep, Upload, utcnow
+from app.schemas.tasks import PlanOut, StepOut, TaskOut, UploadOut
+from app.services.costing import estimate_cost_cny
+from app.services.files import (
+    MAX_BYTES,
+    MAX_FILES,
+    assert_allowed,
+    atomic_write_text,
+    extract_text,
+    read_upload_bytes,
+    safe_filename,
+)
+from app.services.llm import chat_completion
+from app.services.office_speed import accelerate_plan, is_write_skill
+from app.services.search import fetch_url_text, web_search
+
+PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
+
+_ARCHIVEABLE = frozenset({"succeeded", "failed", "paused", "plan_ready"})
+_HIDDEN_STATUSES = frozenset({"merged", "archived"})
+
+
+def _load_prompt(name: str) -> str:
+    return (PROMPT_DIR / name).read_text(encoding="utf-8")
+
+
+def _parse_plan(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:].strip()
+    data = json.loads(text)
+    plan = PlanOut.model_validate(data)
+    if not (3 <= len(plan.steps) <= 8):
+        raise ValueError("steps length")
+    return plan.model_dump()
+
+
+def _plan_meta(task: Task) -> dict[str, Any]:
+    if not task.plan_json:
+        return {}
+    try:
+        raw = json.loads(task.plan_json)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_plan_meta(task: Task, meta: dict[str, Any]) -> None:
+    task.plan_json = json.dumps(meta, ensure_ascii=False)
+
+
+def serialize_task(task: Task, *, search_query: str | None = None) -> TaskOut:
+    plan = None
+    skill_id = None
+    expert_id = None
+    merged_into_id = None
+    merged_from_ids: list[str] = []
+    raw = _plan_meta(task)
+    if raw:
+        skill_id = raw.get("skill_id")
+        expert_id = raw.get("expert_id")
+        merged_into_id = raw.get("merged_into_id")
+        from_ids = raw.get("merged_from_ids") or []
+        if isinstance(from_ids, list):
+            merged_from_ids = [str(x) for x in from_ids]
+        try:
+            plan = PlanOut.model_validate(raw)
+        except Exception:
+            plan = None
+    steps = []
+    for s in task.steps:
+        try:
+            detail = json.loads(s.detail_json or "{}")
+        except Exception:
+            detail = {}
+        steps.append(StepOut(seq=s.seq, name=s.name, status=s.status, detail=detail))
+    uploads = [
+        UploadOut(
+            id=u.id,
+            filename=u.filename,
+            size_bytes=u.size_bytes,
+            text_excerpt=(u.text_excerpt or "")[:500],
+        )
+        for u in task.uploads
+    ]
+    snippet = None
+    q = (search_query or "").strip()
+    if q:
+        snippet = _search_snippet_for_query(task, q)
+    return TaskOut(
+        id=task.id,
+        title=task.title or "",
+        user_prompt=task.user_prompt,
+        status=task.status,
+        cost_estimate_cny=task.cost_estimate_cny,
+        cost_confirmed=task.cost_confirmed,
+        skill_id=skill_id,
+        expert_id=expert_id,
+        plan=plan,
+        steps=steps,
+        uploads=uploads,
+        report_path=task.report_path,
+        has_report=bool(task.report_path and Path(task.report_path).exists()),
+        merged_into_id=merged_into_id,
+        merged_from_ids=merged_from_ids,
+        search_snippet=snippet,
+        error_code=task.error_code,
+        error_message=task.error_message,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+    )
+
+
+def get_task(db: Session, task_id: str) -> Task:
+    task = db.scalar(
+        select(Task)
+        .where(Task.id == task_id)
+        .options(
+            selectinload(Task.steps),
+            selectinload(Task.uploads),
+            selectinload(Task.events),
+        )
+    )
+    if not task:
+        raise AppError("TASK_NOT_FOUND", "任务不存在", status_code=404)
+    return task
+
+
+# Appended when tasks are merged; must not participate in keyword search.
+_MERGE_NOTE_MARK = "【已合并任务】"
+_REPORT_SEARCH_MAX_CHARS = 200_000
+
+
+def _searchable_prompt_text(prompt: str | None) -> str:
+    """User-typed body only — strip the merge appendix that lists other titles."""
+    text = prompt or ""
+    idx = text.find(_MERGE_NOTE_MARK)
+    if idx >= 0:
+        text = text[:idx]
+    return text.rstrip()
+
+
+def _read_report_text(task: Task) -> str:
+    if not task.report_path:
+        return ""
+    path = Path(task.report_path)
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:_REPORT_SEARCH_MAX_CHARS]
+    except OSError:
+        return ""
+
+
+def _task_matches_query(task: Task, query: str) -> bool:
+    needle = query.lower()
+    prompt = _searchable_prompt_text(task.user_prompt).lower()
+    if task.status == "archived":
+        # Archived: original prompt or report — not auto plan titles.
+        return needle in prompt or needle in _read_report_text(task).lower()
+    title = (task.title or "").lower()
+    if needle in title or needle in prompt:
+        return True
+    return needle in _read_report_text(task).lower()
+
+
+def _search_snippet_for_query(task: Task, query: str) -> str | None:
+    """When only the report matched, return a short excerpt for the side rail."""
+    needle = query.lower()
+    title = (task.title or "").lower()
+    prompt = _searchable_prompt_text(task.user_prompt).lower()
+    if task.status != "archived" and needle in title:
+        return None
+    if needle in prompt:
+        return None
+    report = _read_report_text(task)
+    lower = report.lower()
+    idx = lower.find(needle)
+    if idx < 0:
+        return None
+    start = max(0, idx - 4)
+    snip = re.sub(r"\s+", " ", report[start : start + 32]).strip()
+    if not snip:
+        return None
+    suffix = "…" if start + 32 < len(report) else ""
+    prefix = "…" if start > 0 else ""
+    return f"{prefix}{snip}{suffix}"
+
+
+def list_tasks(
+    db: Session,
+    *,
+    include_merged: bool = False,
+    include_archived: bool = False,
+    q: str | None = None,
+    settings: Settings | None = None,
+) -> list[Task]:
+    auto_archive_tasks(db, settings=settings)
+    query = (q or "").strip()
+    stmt = (
+        select(Task)
+        .options(selectinload(Task.steps), selectinload(Task.uploads))
+        .order_by(Task.created_at.desc())
+    )
+    if not include_merged:
+        stmt = stmt.where(Task.status != "merged")
+    # Searching may surface archived / report hits; otherwise hide archived by default.
+    if not query and not include_archived:
+        stmt = stmt.where(Task.status != "archived")
+    tasks = list(db.scalars(stmt))
+    if not query:
+        return tasks
+    return [t for t in tasks if _task_matches_query(t, query)]
+
+
+def _mark_archived(db: Session, task: Task) -> None:
+    meta = _plan_meta(task)
+    meta["archived_from_status"] = task.status
+    _save_plan_meta(task, meta)
+    task.status = "archived"
+    task.updated_at = utcnow()
+    append_event(db, task, "progress", {"message": "已自动归档（列表过长或过旧）"})
+
+
+def _as_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def auto_archive_tasks(db: Session, settings: Settings | None = None) -> int:
+    """Archive old / excess idle tasks. Returns number newly archived."""
+    settings = settings or get_settings()
+    keep = max(1, int(settings.task_keep_recent or 8))
+    days = max(1, int(settings.task_archive_after_days or 7))
+    cutoff = utcnow() - timedelta(days=days)
+    changed = 0
+
+    active = list(
+        db.scalars(
+            select(Task)
+            .where(Task.status.notin_(list(_HIDDEN_STATUSES)))
+            .order_by(Task.updated_at.asc())
+        )
+    )
+    for task in active:
+        if task.status not in _ARCHIVEABLE:
+            continue
+        stamp = _as_utc(task.updated_at or task.created_at)
+        if stamp and stamp < cutoff:
+            _mark_archived(db, task)
+            changed += 1
+
+    active = list(
+        db.scalars(
+            select(Task)
+            .where(Task.status.notin_(list(_HIDDEN_STATUSES)))
+            .order_by(Task.updated_at.asc())
+        )
+    )
+    if len(active) > keep:
+        need = len(active) - keep
+        candidates = [t for t in active if t.status in _ARCHIVEABLE]
+        candidates.sort(key=lambda t: _as_utc(t.updated_at or t.created_at) or utcnow())
+        for task in candidates[:need]:
+            if task.status == "archived":
+                continue
+            _mark_archived(db, task)
+            changed += 1
+
+    if changed:
+        db.commit()
+    return changed
+
+
+def unarchive_task(db: Session, task_id: str) -> Task:
+    task = get_task(db, task_id)
+    if task.status != "archived":
+        raise AppError("INVALID_STATE", "仅已归档任务可恢复")
+    meta = _plan_meta(task)
+    prev = meta.pop("archived_from_status", None)
+    if prev in _ARCHIVEABLE:
+        task.status = str(prev)
+    elif _task_has_report(task):
+        task.status = "succeeded"
+    else:
+        task.status = "plan_ready"
+    _save_plan_meta(task, meta)
+    task.updated_at = utcnow()
+    append_event(db, task, "progress", {"message": "已从归档恢复"})
+    db.commit()
+    return get_task(db, task_id)
+
+
+def _task_has_report(task: Task) -> bool:
+    return bool(task.report_path and Path(task.report_path).exists())
+
+
+def _pick_merge_primary(tasks: list[Task]) -> Task:
+    with_report = [t for t in tasks if _task_has_report(t)]
+    if with_report:
+        return max(with_report, key=lambda t: t.updated_at or t.created_at)
+    succeeded = [t for t in tasks if t.status == "succeeded"]
+    if succeeded:
+        return max(succeeded, key=lambda t: t.updated_at or t.created_at)
+    return max(tasks, key=lambda t: t.created_at)
+
+
+def _invalidate_export_caches(task_id: str, settings: Settings) -> None:
+    art = settings.artifacts_path / task_id
+    for name in ("report.docx", "report.xlsx", "report.pptx"):
+        p = art / name
+        if p.exists():
+            p.unlink()
+
+
+def merge_tasks(
+    db: Session,
+    task_ids: list[str],
+    settings: Settings | None = None,
+) -> Task:
+    """Merge multiple tasks into one primary; mark others as merged."""
+    settings = settings or get_settings()
+    ids = []
+    seen: set[str] = set()
+    for tid in task_ids:
+        tid = (tid or "").strip()
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        ids.append(tid)
+    if len(ids) < 2:
+        raise AppError("VALIDATION_ERROR", "请至少选择 2 条任务合并")
+
+    tasks = [get_task(db, tid) for tid in ids]
+    blocked = {"running", "planning", "merged", "archived"}
+    for t in tasks:
+        if t.status in blocked:
+            raise AppError(
+                "INVALID_STATE",
+                f"任务「{t.title or t.id[:8]}」状态为 {t.status}，不可合并",
+            )
+
+    primary = _pick_merge_primary(tasks)
+    others = [t for t in tasks if t.id != primary.id]
+
+    sections: list[str] = []
+    if _task_has_report(primary):
+        sections.append(Path(primary.report_path).read_text(encoding="utf-8").strip())
+    for t in others:
+        if not _task_has_report(t):
+            continue
+        body = Path(t.report_path).read_text(encoding="utf-8").strip()
+        if not body:
+            continue
+        label = t.title or t.id[:8]
+        sections.append(f"## 附录：来自「{label}」\n\n{body}")
+
+    if sections:
+        art_dir = settings.artifacts_path / primary.id
+        art_dir.mkdir(parents=True, exist_ok=True)
+        report_path = art_dir / "report.md"
+        atomic_write_text(report_path, "\n\n---\n\n".join(sections) + "\n")
+        primary.report_path = str(report_path)
+        _invalidate_export_caches(primary.id, settings)
+
+    note_lines = [f"- {t.title or '未命名'}（{t.id}）" for t in others]
+    merge_note = "【已合并任务】\n" + "\n".join(note_lines)
+    if "【已合并任务】" not in (primary.user_prompt or ""):
+        primary.user_prompt = (primary.user_prompt or "").rstrip() + "\n\n" + merge_note
+
+    primary_meta = _plan_meta(primary)
+    prev = primary_meta.get("merged_from_ids") or []
+    if not isinstance(prev, list):
+        prev = []
+    merged_from = list(dict.fromkeys([*prev, *[t.id for t in others]]))
+    primary_meta["merged_from_ids"] = merged_from
+    _save_plan_meta(primary, primary_meta)
+    primary.updated_at = utcnow()
+
+    for t in others:
+        meta = _plan_meta(t)
+        meta["merged_into_id"] = primary.id
+        _save_plan_meta(t, meta)
+        t.status = "merged"
+        t.updated_at = utcnow()
+        append_event(
+            db,
+            t,
+            "progress",
+            {"message": f"已合并到任务 {primary.id}", "merged_into_id": primary.id},
+        )
+
+    append_event(
+        db,
+        primary,
+        "progress",
+        {
+            "message": f"已并入 {len(others)} 条任务",
+            "merged_from_ids": [t.id for t in others],
+        },
+    )
+    db.commit()
+    return get_task(db, primary.id)
+
+
+def append_event(db: Session, task: Task, event_type: str, payload: dict[str, Any]) -> None:
+    db.add(
+        TaskEvent(
+            task_id=task.id,
+            event_type=event_type,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+        )
+    )
+
+
+def recover_running_tasks(db: Session) -> int:
+    tasks = list(db.scalars(select(Task).where(Task.status == "running")))
+    for task in tasks:
+        task.status = "paused"
+        task.updated_at = utcnow()
+        append_event(db, task, "progress", {"message": "服务重启，任务已暂停，可点继续"})
+    if tasks:
+        db.commit()
+    return len(tasks)
+
+
+async def create_task(
+    db: Session,
+    prompt: str,
+    urls: list[str],
+    settings: Settings | None = None,
+    skill_id: str | None = None,
+    expert_id: str | None = None,
+    source_schedule_id: str | None = None,
+) -> Task:
+    from app.services.catalog import resolve_skill_and_expert
+
+    settings = settings or get_settings()
+    skill, expert = resolve_skill_and_expert(skill_id, expert_id)
+    meta = {
+        "urls": urls,
+        "skill_id": skill["id"] if skill else None,
+        "expert_id": expert["id"] if expert else None,
+    }
+    if source_schedule_id:
+        meta["source_schedule_id"] = source_schedule_id
+    task = Task(
+        id=str(uuid.uuid4()),
+        title="",
+        user_prompt=prompt.strip(),
+        status="planning",
+        plan_json=json.dumps(meta, ensure_ascii=False),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    await generate_plan(db, task.id, urls=urls, settings=settings)
+    return get_task(db, task.id)
+
+
+async def generate_plan(
+    db: Session,
+    task_id: str,
+    urls: list[str] | None = None,
+    settings: Settings | None = None,
+) -> Task:
+    from app.services.catalog import resolve_skill_and_expert
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    task.status = "planning"
+    task.error_code = None
+    task.error_message = None
+    db.commit()
+
+    existing = {}
+    try:
+        existing = json.loads(task.plan_json or "{}")
+    except Exception:
+        existing = {}
+    url_list = urls if urls is not None else existing.get("urls") or []
+    skill, expert = resolve_skill_and_expert(existing.get("skill_id"), existing.get("expert_id"))
+    upload_summary = "\n".join(
+        f"- {u.filename}: {(u.text_excerpt or '')[:300]}" for u in task.uploads
+    ) or "（无）"
+
+    system = _load_prompt("plan.md")
+    if skill:
+        system += f"\n\n【技能：{skill['name']}】\n{skill['plan_hint']}\n"
+    if expert:
+        system += f"\n\n【专家人设：{expert['name']}】\n{expert['persona']}\n"
+    user = (
+        f"用户需求：\n{task.user_prompt}\n\n"
+        f"参考链接：{url_list}\n\n"
+        f"上传材料摘要：\n{upload_summary}\n"
+    )
+    if skill:
+        user += f"\n请按技能「{skill['name']}」组织步骤。skill_id={skill['id']}\n"
+
+    plan_dict = None
+    skill_id = skill["id"] if skill else None
+    for _ in range(3):
+        try:
+            raw = await chat_completion(settings, system, user)
+            plan_dict = _parse_plan(raw)
+            plan_dict = accelerate_plan(plan_dict, skill_id)
+            break
+        except Exception:
+            plan_dict = None
+    if plan_dict is None:
+        task.status = "failed"
+        task.error_code = "PLAN_FAILED"
+        task.error_message = "计划生成失败，请重试"
+        append_event(db, task, "error", {"code": "PLAN_FAILED", "message": task.error_message})
+        db.commit()
+        raise AppError("PLAN_FAILED", "计划生成失败，请重试", status_code=500)
+
+    cost = estimate_cost_cny(settings, plan_dict)
+    task.title = plan_dict.get("title") or "调研任务"
+    plan_payload = {
+        **plan_dict,
+        "urls": url_list,
+        "skill_id": skill_id,
+        "expert_id": expert["id"] if expert else None,
+    }
+    # 保留自动化来源，供 1.22 A→B 事件触发关联
+    if existing.get("source_schedule_id"):
+        plan_payload["source_schedule_id"] = existing["source_schedule_id"]
+    task.plan_json = json.dumps(plan_payload, ensure_ascii=False)
+    task.cost_estimate_cny = cost
+    task.cost_confirmed = False
+    task.status = "plan_ready"
+
+    for s in list(task.steps):
+        db.delete(s)
+    db.flush()
+    for i, step in enumerate(plan_dict.get("steps") or [], start=1):
+        db.add(
+            TaskStep(
+                task_id=task.id,
+                seq=i,
+                name=step.get("name") or f"步骤{i}",
+                status="pending",
+                detail_json=json.dumps(step, ensure_ascii=False),
+            )
+        )
+    append_event(
+        db,
+        task,
+        "progress",
+        {"message": "计划已就绪，请确认后执行", "cost_estimate_cny": cost},
+    )
+    db.commit()
+    return get_task(db, task.id)
+
+
+async def replan_task(
+    db: Session,
+    task_id: str,
+    *,
+    prompt: str | None = None,
+    urls: list[str] | None = None,
+    settings: Settings | None = None,
+) -> Task:
+    """Regenerate plan for plan_ready / paused / failed tasks."""
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status not in {"plan_ready", "paused", "failed"}:
+        raise AppError("INVALID_STATE", f"当前状态不可改计划：{task.status}")
+    if prompt is not None:
+        text = prompt.strip()
+        if not text:
+            raise AppError("VALIDATION_ERROR", "请填写任务内容")
+        task.user_prompt = text
+    task.report_path = None
+    task.error_code = None
+    task.error_message = None
+    db.commit()
+    append_event(db, task, "progress", {"message": "正在按新需求重新生成计划"})
+    db.commit()
+    return await generate_plan(db, task_id, urls=urls, settings=settings)
+
+
+async def confirm_and_run(
+    db: Session,
+    task_id: str,
+    confirm_cost: bool = False,
+    settings: Settings | None = None,
+) -> Task:
+    """Sync helper for tests: confirm gates then run agent inline."""
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status not in {"plan_ready", "paused", "failed"}:
+        raise AppError("INVALID_STATE", f"当前状态不可确认执行：{task.status}")
+
+    if task.status == "plan_ready":
+        if task.cost_estimate_cny > settings.cost_soft_limit_cny and not (
+            confirm_cost or task.cost_confirmed
+        ):
+            raise AppError(
+                "COST_CONFIRM_REQUIRED",
+                f"预估费用约 ¥{task.cost_estimate_cny:.2f}，超过软上限 ¥{settings.cost_soft_limit_cny:.0f}，请确认后继续",
+            )
+        if confirm_cost:
+            task.cost_confirmed = True
+
+    task.status = "running"
+    task.error_code = None
+    task.error_message = None
+    append_event(db, task, "progress", {"message": "开始执行"})
+    db.commit()
+    await run_agent_job(db, task_id, settings)
+    return get_task(db, task_id)
+
+
+async def run_agent_job(db: Session, task_id: str, settings: Settings | None = None) -> None:
+    settings = settings or get_settings()
+    try:
+        await _execute_agent(db, task_id, settings)
+    except AppError as exc:
+        if exc.code == "TASK_NOT_FOUND":
+            return
+        task = get_task(db, task_id)
+        if task.status != "paused":
+            task.status = "failed"
+            task.error_code = exc.code
+            task.error_message = exc.message
+            append_event(
+                db, task, "error", {"code": task.error_code, "message": task.error_message}
+            )
+            db.commit()
+    except Exception:
+        try:
+            task = get_task(db, task_id)
+        except AppError:
+            return
+        if task.status != "paused":
+            task.status = "failed"
+            task.error_code = "RUN_FAILED"
+            task.error_message = "执行失败，请改计划或重试"
+            append_event(
+                db, task, "error", {"code": task.error_code, "message": task.error_message}
+            )
+            db.commit()
+
+
+async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
+    from app.services.workspace import collect_workspace_excerpts
+
+    task = get_task(db, task_id)
+    plan = json.loads(task.plan_json or "{}")
+    urls = plan.get("urls") or []
+    skill_id = plan.get("skill_id")
+    write_fast = is_write_skill(skill_id)
+    search_bits: list[str] = []
+    # 默认不灌资料库全文：只跟用户主动添加的参考（上传 / workspace-refs）走。
+    # 步骤明确要求读本地文件时，仍可在下方 local/本地 分支按需 collect。
+    ref_texts = [
+        (u.text_excerpt or "").strip()
+        for u in task.uploads
+        if (u.text_excerpt or "").strip()
+    ]
+    if ref_texts:
+        joined = "\n---\n".join(ref_texts)[:4000]
+        search_bits.append("用户添加的参考材料：\n" + joined)
+        append_event(db, task, "progress", {"message": "已读取用户添加的参考材料"})
+        db.commit()
+    steps = list(task.steps)
+    max_steps = min(len(steps), settings.agent_max_steps)
+
+    for idx, step in enumerate(steps[:max_steps], start=1):
+        db.refresh(task)
+        task = get_task(db, task_id)
+        if task.status == "paused":
+            append_event(db, task, "progress", {"message": "已暂停"})
+            db.commit()
+            return
+
+        if step.status == "done":
+            try:
+                detail = json.loads(step.detail_json or "{}")
+            except Exception:
+                detail = {}
+            if detail.get("results"):
+                search_bits.append(json.dumps(detail["results"], ensure_ascii=False))
+            continue
+
+        step.status = "running"
+        append_event(
+            db, task, "step", {"seq": step.seq, "name": step.name, "status": "running"}
+        )
+        db.commit()
+
+        detail = {}
+        try:
+            detail = json.loads(step.detail_json or "{}")
+        except Exception:
+            detail = {}
+        hint = (detail.get("tool_hint") or "").lower()
+
+        if "search" in hint or "检索" in step.name:
+            if write_fast:
+                detail["note"] = "写类办公加速：跳过联网检索"
+                append_event(
+                    db,
+                    task,
+                    "progress",
+                    {"message": f"跳过检索（写类加速）：{step.name}"},
+                )
+            else:
+                results = await web_search(settings, task.user_prompt[:200])
+                search_bits.append(json.dumps(results, ensure_ascii=False))
+                detail["results"] = results
+        elif "fetch" in hint and urls:
+            text = await fetch_url_text(urls[0])
+            search_bits.append(text[:2000])
+            detail["fetched_chars"] = len(text)
+        elif "upload" in hint or "材料" in step.name or "local" in hint or "本地" in step.name:
+            texts = [u.text_excerpt or "" for u in task.uploads]
+            search_bits.append("\n".join(texts)[:4000])
+            detail["upload_count"] = len(texts)
+            if "local" in hint or "本地" in step.name:
+                extra = collect_workspace_excerpts(settings)
+                if extra:
+                    search_bits.append(extra)
+                    detail["workspace_chars"] = len(extra)
+        elif "write" in hint or "报告" in step.name or "成稿" in step.name or idx == max_steps:
+            report = await _write_report(settings, task, search_bits)
+            art_dir = settings.artifacts_path / task.id
+            report_path = art_dir / "report.md"
+            atomic_write_text(report_path, report)
+            task.report_path = str(report_path)
+            detail["report_path"] = str(report_path)
+            append_event(
+                db, task, "artifact", {"kind": "report", "path": str(report_path)}
+            )
+        else:
+            # generic step: small wait marker
+            detail["note"] = "completed"
+
+        step.detail_json = json.dumps(detail, ensure_ascii=False)
+        step.status = "done"
+        append_event(db, task, "step", {"seq": step.seq, "name": step.name, "status": "done"})
+        append_event(
+            db,
+            task,
+            "progress",
+            {"message": f"完成：{step.name}", "percent": int(idx / max_steps * 100)},
+        )
+        db.commit()
+        await asyncio.sleep(0.05)
+
+    task = get_task(db, task_id)
+    if task.status == "paused":
+        return
+
+    if not task.report_path:
+        report = await _write_report(settings, task, search_bits)
+        report_path = settings.artifacts_path / task.id / "report.md"
+        atomic_write_text(report_path, report)
+        task.report_path = str(report_path)
+        append_event(db, task, "artifact", {"kind": "report", "path": str(report_path)})
+
+    task.status = "succeeded"
+    append_event(db, task, "done", {"task_id": task.id, "status": "succeeded"})
+    db.commit()
+
+
+async def _write_report(settings: Settings, task: Task, search_bits: list[str]) -> str:
+    from app.services.catalog import resolve_skill_and_expert
+
+    system = _load_prompt("report.md")
+    try:
+        meta = json.loads(task.plan_json or "{}")
+    except Exception:
+        meta = {}
+    skill, expert = resolve_skill_and_expert(meta.get("skill_id"), meta.get("expert_id"))
+    if expert:
+        system += f"\n\n【专家人设：{expert['name']}】\n{expert['persona']}\n"
+    if skill:
+        system += f"\n\n【技能成稿要求：{skill['name']}】\n{skill['report_hint']}\n"
+    user = (
+        f"用户需求：\n{task.user_prompt}\n\n"
+        f"计划：\n{task.plan_json}\n\n"
+        f"已收集摘录：\n" + "\n---\n".join(search_bits[:6])
+    )
+    return await chat_completion(settings, system, user)
+
+
+async def rewrite_report(
+    db: Session,
+    task_id: str,
+    instruction: str,
+    settings: Settings | None = None,
+) -> Task:
+    """Rewrite an existing succeeded report using a user instruction."""
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status != "succeeded":
+        raise AppError("INVALID_STATE", "仅已成功完成的任务可重写报告")
+    if not task.report_path or not Path(task.report_path).exists():
+        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
+    text = (instruction or "").strip()
+    if not text:
+        raise AppError("VALIDATION_ERROR", "请填写改写指令")
+
+    old = Path(task.report_path).read_text(encoding="utf-8")
+    system = _load_prompt("report.md")
+    system += (
+        "\n\n你正在按用户指令改写已有 Markdown 报告。"
+        "保持结构清晰，仍遵守来源与待核实约束；输出完整报告正文。"
+    )
+    user = (
+        f"用户原始需求：\n{task.user_prompt}\n\n"
+        f"【改写指令】\n{text}\n\n"
+        f"【当前报告】\n{old[:12000]}\n"
+    )
+    new_md = await chat_completion(settings, system, user)
+    report_path = Path(task.report_path)
+    atomic_write_text(report_path, new_md)
+    # invalidate export caches
+    art = settings.artifacts_path / task.id
+    for name in ("report.docx", "report.xlsx", "report.pptx"):
+        p = art / name
+        if p.exists():
+            p.unlink()
+    append_event(db, task, "artifact", {"kind": "report_rewrite", "instruction": text[:200]})
+    db.commit()
+    return get_task(db, task_id)
+
+
+def pause_task(db: Session, task_id: str) -> Task:
+    task = get_task(db, task_id)
+    if task.status != "running":
+        raise AppError("INVALID_STATE", "仅运行中的任务可暂停")
+    task.status = "paused"
+    append_event(db, task, "progress", {"message": "用户暂停"})
+    db.commit()
+    return get_task(db, task_id)
+
+
+async def resume_task(db: Session, task_id: str, settings: Settings | None = None) -> Task:
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status != "paused":
+        raise AppError("INVALID_STATE", "仅暂停中的任务可继续")
+    return await confirm_and_run(db, task_id, confirm_cost=True, settings=settings)
+
+
+def delete_task(db: Session, task_id: str, settings: Settings | None = None) -> None:
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    upload_dir = settings.uploads_path / task.id
+    art_dir = settings.artifacts_path / task.id
+    db.delete(task)
+    db.commit()
+    if upload_dir.exists():
+        shutil.rmtree(upload_dir, ignore_errors=True)
+    if art_dir.exists():
+        shutil.rmtree(art_dir, ignore_errors=True)
+
+
+async def add_upload(db: Session, task_id: str, upload_file, settings: Settings | None = None) -> Upload:
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if len(task.uploads) >= MAX_FILES:
+        raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
+    if task.status in {"running"}:
+        raise AppError("INVALID_STATE", "运行中不可上传")
+
+    filename = safe_filename(upload_file.filename or "upload.bin")
+    ext = assert_allowed(filename)
+    data = await read_upload_bytes(upload_file)
+    dest_dir = settings.uploads_path / task.id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    dest.write_bytes(data)
+    excerpt = extract_text(dest, ext)
+    row = Upload(
+        task_id=task.id,
+        filename=filename,
+        stored_path=str(dest),
+        mime=upload_file.content_type or "application/octet-stream",
+        size_bytes=len(data),
+        text_excerpt=excerpt,
+    )
+    db.add(row)
+    append_event(db, task, "progress", {"message": f"已上传 {filename}"})
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def add_workspace_refs(
+    db: Session,
+    task_id: str,
+    paths: list[str],
+    settings: Settings | None = None,
+) -> Task:
+    """Attach files from the authorized workspace as task reference uploads."""
+    from app.services import workspace as ws
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status in {"running", "succeeded"}:
+        raise AppError("INVALID_STATE", "当前状态不可再添加参考材料")
+    if not paths:
+        raise AppError("VALIDATION_ERROR", "请选择至少一个资料库文件")
+
+    root = ws.require_root(settings)
+    dest_dir = settings.uploads_path / task.id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    used = len(task.uploads)
+
+    for rel in paths:
+        if used >= MAX_FILES:
+            raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
+        src = ws.safe_resolve(root, rel)
+        if not src.is_file():
+            raise AppError("FILE_NOT_FOUND", f"资料库文件不存在：{rel}", status_code=404)
+        filename = safe_filename(src.name)
+        ext = assert_allowed(filename)
+        size = src.stat().st_size
+        if size > MAX_BYTES:
+            raise AppError("UPLOAD_TOO_LARGE", f"{filename} 超过 20MB")
+        dest = dest_dir / filename
+        if dest.exists():
+            dest = dest_dir / f"ws_{filename}"
+        dest.write_bytes(src.read_bytes())
+        excerpt = extract_text(dest, ext)
+        row = Upload(
+            task_id=task.id,
+            filename=dest.name,
+            stored_path=str(dest),
+            mime="application/octet-stream",
+            size_bytes=size,
+            text_excerpt=excerpt,
+        )
+        db.add(row)
+        used += 1
+        append_event(db, task, "progress", {"message": f"已从资料库添加 {dest.name}"})
+
+    db.commit()
+    return get_task(db, task_id)
+
+
+def read_report(db: Session, task_id: str) -> str:
+    task = get_task(db, task_id)
+    if not task.report_path or not Path(task.report_path).exists():
+        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
+    return Path(task.report_path).read_text(encoding="utf-8")
+
+
+def report_download_stem(task: Task) -> str:
+    """Safe basename (no extension) for report downloads."""
+    raw = (task.title or "").strip() or "report"
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    if not cleaned:
+        cleaned = "report"
+    return cleaned[:80]
+
+def ensure_docx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
+    from app.services.docx_export import ensure_docx_from_markdown
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if not task.report_path or not Path(task.report_path).exists():
+        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
+    docx_path = settings.artifacts_path / task.id / "report.docx"
+    if docx_path.exists() and docx_path.stat().st_size > 0:
+        return docx_path
+    return ensure_docx_from_markdown(Path(task.report_path), docx_path)
+
+
+def ensure_xlsx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
+    from app.services.xlsx_export import ensure_xlsx_from_markdown
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if not task.report_path or not Path(task.report_path).exists():
+        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
+    xlsx_path = settings.artifacts_path / task.id / "report.xlsx"
+    if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
+        return xlsx_path
+    return ensure_xlsx_from_markdown(Path(task.report_path), xlsx_path)
+
+
+def ensure_pptx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
+    from app.services.pptx_export import ensure_pptx_from_markdown
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if not task.report_path or not Path(task.report_path).exists():
+        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
+    pptx_path = settings.artifacts_path / task.id / "report.pptx"
+    if pptx_path.exists() and pptx_path.stat().st_size > 0:
+        return pptx_path
+    return ensure_pptx_from_markdown(Path(task.report_path), pptx_path)
+
+
+async def export_report_to_feishu(
+    db: Session,
+    task_id: str,
+    *,
+    confirmed: bool,
+    as_app: bool = False,
+    settings: Settings | None = None,
+) -> dict:
+    from app.services.feishu_export import export_markdown_to_feishu
+
+    if not confirmed:
+        raise AppError(
+            "CONFIRM_REQUIRED",
+            "导出到飞书将在云端创建文档，请确认后继续",
+            status_code=400,
+        )
+
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    markdown = read_report(db, task_id)
+    if task.status != "succeeded":
+        raise AppError("INVALID_STATE", "仅已完成的任务可导出到飞书", status_code=400)
+    title = (task.title or "调研报告").strip() or "调研报告"
+    artifact_dir = settings.artifacts_path / task.id
+    result = await export_markdown_to_feishu(
+        markdown=markdown,
+        title=title,
+        artifact_dir=artifact_dir,
+        settings=settings,
+        as_app=bool(as_app),
+    )
+    append_event(
+        db,
+        task,
+        "artifact",
+        {
+            "kind": "feishu_export",
+            "document_id": result.get("document_id"),
+            "mock": bool(result.get("mock")),
+            "identity": result.get("identity"),
+            "space": result.get("space"),
+        },
+    )
+    db.commit()
+    return result

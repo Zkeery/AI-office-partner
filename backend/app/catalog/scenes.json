@@ -1,0 +1,123 @@
+[
+  {
+    "id": "competitor_research",
+    "name": "竞品调研",
+    "category": "research",
+    "blurb": "对比产品/公司，出可交差调研稿",
+    "prompt_template": "请对「某某产品」做竞品调研：对比 2～3 个主要竞品的定位、核心功能、优劣势，并给出建议。",
+    "skill_id": "competitor_research",
+    "expert_id": "industry_analyst",
+    "keywords": ["竞品", "对手", "对比", "竞对", "竞品调研"]
+  },
+  {
+    "id": "meeting_minutes",
+    "name": "会议纪要",
+    "category": "writing",
+    "blurb": "决议、待办、责任人，可转发",
+    "prompt_template": "请根据以下会议笔记整理成会议纪要（含决议与待办）。会议主题：……\n\n笔记：\n- ",
+    "skill_id": "meeting_minutes",
+    "expert_id": "briefing_aide",
+    "keywords": ["会议纪要", "纪要", "会议记录", "决议", "待办清单"]
+  },
+  {
+    "id": "weekly_report",
+    "name": "周报总结",
+    "category": "writing",
+    "blurb": "本周进展 · 问题 · 下周计划",
+    "prompt_template": "请帮我写一份周报：\n本周完成：\n- \n遇到的问题：\n- \n下周计划：\n- ",
+    "skill_id": "weekly_report",
+    "expert_id": "ops_writer",
+    "keywords": ["周报", "本周进展", "本周工作", "下周计划", "周总结"]
+  },
+  {
+    "id": "email_draft",
+    "name": "邮件稿",
+    "category": "writing",
+    "blurb": "主题清晰、可直接粘贴发送",
+    "prompt_template": "请帮我写一封工作邮件：\n收件人角色：……\n目的：……\n要点：\n- \n语气：正式 / 简洁\n",
+    "skill_id": "email_draft",
+    "expert_id": "biz_writer",
+    "keywords": ["邮件", "邮件稿", "写邮件", "发信", "邮件正文", "邮件主题"]
+  },
+  {
+    "id": "proposal_template",
+    "name": "方案模板",
+    "category": "writing",
+    "blurb": "背景·目标·方案·风险，可交差",
+    "prompt_template": "请按方案模板起草一份方案：\n主题：……\n背景与问题：……\n目标：……\n拟议方案要点：\n- \n约束/预算/时间（若有）：……\n",
+    "skill_id": "proposal_template",
+    "expert_id": "biz_writer",
+    "keywords": ["方案", "方案模板", "立项方案", "解决方案", "实施计划", "项目方案"]
+  },
+  {
+    "id": "table_analysis",
+    "name": "表格分析",
+    "category": "data",
+    "blurb": "上传 CSV/Excel，结论+图表说明",
+    "prompt_template": "请基于我将上传的表格做分析：说明数据概览、关键发现、建议图表（类型与读图结论）、异常与可执行建议。主题：……",
+    "skill_id": "table_analysis",
+    "expert_id": "data_analyst",
+    "keywords": ["表格分析", "excel", "csv", "数据分析", "汇总表", "透视", "图表"],
+    "needs_table_upload": true
+  },
+  {
+    "id": "policy_brief",
+    "name": "政策速读",
+    "category": "research",
+    "blurb": "适用谁·改什么·风险待办",
+    "prompt_template": "请对以下政策/通知做速读摘要：给出一句话结论、适用对象、关键变化、对业务影响、建议动作。主题或链接：……",
+    "skill_id": "policy_brief",
+    "expert_id": "policy_reader",
+    "keywords": ["政策", "政策速读", "新规", "通知解读", "合规", "条例"]
+  },
+  {
+    "id": "customer_reply",
+    "name": "对客话术",
+    "category": "writing",
+    "blurb": "可直接对客用的回复口径",
+    "prompt_template": "请起草对客话术：\n场景：……\n客户诉求：……\n已知事实：……\n语气：礼貌 / 简洁\n渠道：邮件 / IM / 电话提纲\n",
+    "skill_id": "customer_reply",
+    "expert_id": "customer_voice",
+    "keywords": ["对客", "话术", "客诉", "客户回复", "安抚", "改期说明"]
+  },
+  {
+    "id": "project_update",
+    "name": "项目推进",
+    "category": "writing",
+    "blurb": "进度·阻塞·下一步，可同步",
+    "prompt_template": "请写一份项目推进短更新：\n项目名：……\n本阶段目标：……\n已完成：\n- \n阻塞：\n- \n下一步：\n- \n",
+    "skill_id": "project_update",
+    "expert_id": "project_coordinator",
+    "keywords": ["项目推进", "项目周报", "进度同步", "干系人", "阻塞", "里程碑"]
+  },
+  {
+    "id": "speech_script",
+    "name": "汇报发言稿",
+    "category": "writing",
+    "blurb": "开场·要点·收束，可上台念",
+    "prompt_template": "请起草一份汇报发言稿：\n场合：……\n听众：……\n时长约：……分钟\n要讲清的结论：……\n必须提到的事实：\n- \n语气：正式 / 口语\n",
+    "skill_id": "speech_script",
+    "expert_id": "speech_coach",
+    "keywords": ["发言稿", "汇报稿", "演讲稿", "汇报发言", "上台发言", "口头汇报"]
+  },
+  {
+    "id": "event_retro",
+    "name": "活动复盘",
+    "category": "writing",
+    "blurb": "目标·结果·原因·改进，可同步",
+    "prompt_template": "请写一份活动/项目复盘：\n主题：……\n原定目标：……\n实际结果：……\n做得好的：\n- \n没做好的：\n- \n下次改进：\n- \n",
+    "skill_id": "event_retro",
+    "expert_id": "retro_facilitator",
+    "keywords": ["活动复盘", "项目复盘", "复盘总结", "复盘会", "事后复盘", "复盘报告"]
+  },
+  {
+    "id": "internal_notice",
+    "name": "通知公告",
+    "category": "writing",
+    "blurb": "对象·事项·时间·行动，可张贴",
+    "prompt_template": "请起草一份内部通知/公告：\n对象：……\n事项：……\n生效或截止时间：……\n需要对方做什么：……\n联系人（若有）：……\n语气：正式 / 简洁\n",
+    "skill_id": "internal_notice",
+    "expert_id": "notice_writer",
+    "keywords": ["通知公告", "内部通知", "全员通知", "发公告", "告示", "内部公告"]
+  }
+]
