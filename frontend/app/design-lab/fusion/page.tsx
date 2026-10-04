@@ -1,1 +1,1 @@
-export { default } from "../lilac/page";
+export { default } from "../../page";

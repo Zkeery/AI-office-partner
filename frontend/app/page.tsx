@@ -26,6 +26,7 @@ import {
   getFeishuOAuthStatus,
   mockConnectFeishuOAuth,
   getReport,
+  getTask,
   getWorkspace,
   listExperts,
   listScenes,
@@ -53,6 +54,7 @@ import { exportLabel, type ExportKind } from "@/lib/export-prefs";
 import { linkifyReport } from "@/lib/linkify-report";
 import { ReportWorkbench } from "@/components/ReportWorkbench";
 import { ModelPicker } from "@/components/ModelPicker";
+import { FusionHome, FusionShell, type WorkspacePanel } from "@/components/FusionWorkspace";
 import {
   ackRunIds,
   formatNoticeLine,
@@ -60,7 +62,7 @@ import {
   unreadFailures,
 } from "@/lib/schedule-notices";
 
-type Panel = "compose" | "task" | "workspace" | "schedules";
+type Panel = WorkspacePanel;
 type WorkspaceEntry = { name: string; rel: string; is_dir: boolean; size: number; mtime?: number };
 
 type WorkspaceEntryCategory =
@@ -246,6 +248,9 @@ export default function HomePage() {
   const [taskBackTo, setTaskBackTo] = useState<Panel | null>(null);
   const taskBackToRef = useRef<Panel | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const refreshSequence = useRef(0);
+  const [taskLoading, setTaskLoading] = useState(true);
+  const [routeReady, setRouteReady] = useState(false);
   const [selected, setSelected] = useState<Task | null>(null);
   const [prompt, setPrompt] = useState("");
   const [urls, setUrls] = useState("");
@@ -472,12 +477,14 @@ export default function HomePage() {
   }
 
   async function refresh(selectId?: string | null) {
+    const request = ++refreshSequence.current;
     const q = taskQuery.trim();
     const items = await listTasks({
       includeMerged: true,
       q: q || undefined,
     });
     // Backend is source of truth for q (title / prompt / report); keep defense only for empty q.
+    if (request !== refreshSequence.current) return;
     setTasks(items);
     if (selectId === null) {
       setSelected(null);
@@ -486,7 +493,8 @@ export default function HomePage() {
     }
     const id = selectId ?? selected?.id;
     if (id) {
-      const t = items.find((x) => x.id === id);
+      const t = items.find((x) => x.id === id) || await getTask(id);
+      if (request !== refreshSequence.current) return;
       if (!t) {
         setSelected(null);
         setReport("");
@@ -501,7 +509,8 @@ export default function HomePage() {
         setExpandedMergeIds((prev) => (prev.includes(t.id) ? prev : [...prev, t.id]));
       }
       if (t.has_report) {
-        setReport(await getReport(t.id));
+        const markdown = await getReport(t.id);
+        if (request === refreshSequence.current) setReport(markdown);
       } else {
         setReport("");
       }
@@ -509,7 +518,12 @@ export default function HomePage() {
   }
 
   useEffect(() => {
-    refresh().catch((e) => setError(String(e.message || e)));
+    const initial = new URLSearchParams(window.location.search);
+    const taskId = initial.get("task");
+    const requestedPanel = initial.get("panel");
+    if (taskId) setPanel("task");
+    else if (requestedPanel && ["compose", "tasks", "workspace", "schedules"].includes(requestedPanel)) setPanel(requestedPanel as Panel);
+    refresh(taskId || undefined).catch((e) => setError(String(e.message || e))).finally(() => { setTaskLoading(false); setRouteReady(true); });
     refreshWorkspace().catch(() => undefined);
     refreshSchedules().catch(() => undefined);
     refreshFeishuOAuth().catch(() => undefined);
@@ -576,6 +590,8 @@ export default function HomePage() {
 
   function startNewCompose() {
     setModelId("");
+    setTaskQueryDraft("");
+    setTaskQuery("");
     setTaskBackTo(null);
     setPanel("compose");
     setSelected(null);
@@ -686,9 +702,10 @@ export default function HomePage() {
   }, [taskQueryDraft]);
 
   useEffect(() => {
+    if (!routeReady) return;
     refresh(selected?.id).catch((e) => setError(String(e.message || e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskQuery]);
+  }, [taskQuery, routeReady]);
 
   const selectedTaskId = selected?.id;
   const selectedTaskStatus = selected?.status;
@@ -723,7 +740,6 @@ export default function HomePage() {
             setExpertId(d.expert_id || "");
             setActiveSceneId(d.scene_id || "");
             setNeedsTableUpload(Boolean(d.needs_table_upload));
-            if (!d.needs_table_upload) clearTableSelection();
             const matched = scenes.find((s) => s.id === d.scene_id);
             if (matched?.category) setPinnedSceneCategory(matched.category);
           }
@@ -783,6 +799,31 @@ export default function HomePage() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
+
+  function navigatePanel(next: Panel) {
+    setError("");
+    setTaskBackTo(null);
+    setPanel(next);
+    if (next !== "tasks") { setTaskQueryDraft(""); setTaskQuery(""); }
+    if ((next === "compose" || next === "tasks") && !taskQuery) void refresh().catch(e => setError(e.message || String(e)));
+    if (next === "workspace") void refreshWorkspace().catch(e => setError(e.message || String(e)));
+    if (next === "schedules") { setShowSchedForm(false); void refreshSchedules().catch(e => setError(e.message || String(e))); }
+  }
+
+  function openTaskSearch() {
+    navigatePanel("tasks");
+    window.setTimeout(() => document.querySelector<HTMLInputElement>('input[aria-label="搜索任务列表"]')?.focus(), 0);
+  }
+
+  useEffect(() => {
+    if (!routeReady) return;
+    const url = new URL(window.location.href);
+    url.searchParams.delete("screen");
+    if (panel === "compose") url.searchParams.delete("panel"); else url.searchParams.set("panel", panel);
+    if (panel === "task" && selected?.id) url.searchParams.set("task", selected.id); else url.searchParams.delete("task");
+    window.history.replaceState(window.history.state, "", url);
+  }, [panel, selected?.id, routeReady]);
+
   function toggleMergeId(id: string) {
     setMergeIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   }
@@ -819,6 +860,8 @@ export default function HomePage() {
   }
 
   async function onCreate() {
+    if (busy) return;
+    if (!prompt.trim()) { setError("请先描述你要完成的任务。"); return; }
     if (!modelId) { setError("请先选择本次任务使用的模型。"); return; }
     setBusy(true);
     setError("");
@@ -850,7 +893,7 @@ export default function HomePage() {
       if (pendingWsTables.length > 0) {
         await attachWorkspaceRefs(t.id, pendingWsTables.slice(0, 3));
       }
-      if (wantTable) {
+      if (pendingTableFiles.length || pendingWsTables.length) {
         await replanTask(t.id);
       }
       setPrompt("");
@@ -859,7 +902,11 @@ export default function HomePage() {
       setDetectHint(null);
       setPendingTableFiles([]);
       setPendingWsTables([]);
-      setNeedsTableUpload(wantTable);
+      setNeedsTableUpload(false);
+      setModelId("");
+      setSkillId("");
+      setExpertId("");
+      setShelfLocked(false);
       setTaskBackTo(null);
       setPanel("task");
       await refresh(t.id);
@@ -893,7 +940,6 @@ export default function HomePage() {
     setNeedsTableUpload(Boolean(scene.needs_table_upload));
     setDetectHint(null);
     setShelfLocked(true);
-    if (!scene.needs_table_upload) clearTableSelection();
   }
 
   function pickTableForAnalysis(rel: string) {
@@ -1182,7 +1228,6 @@ export default function HomePage() {
       setActiveSceneId("");
       setNeedsTableUpload(nextSkillId === "table_analysis");
       setShelfLocked(true);
-      if (nextSkillId !== "table_analysis") clearTableSelection();
       if (!prompt.trim() && skill) {
         setPrompt(`请按「${skill.name}」帮我完成：……`);
       }
@@ -1297,6 +1342,7 @@ export default function HomePage() {
 
   const panelTitle: Record<Panel, string> = {
     compose: "新建任务",
+    tasks: "我的任务",
     task: selected?.title || "当前任务",
     workspace: "资料库",
     schedules: "自动化",
@@ -1492,263 +1538,8 @@ export default function HomePage() {
   );
 
   return (
-    <div className="desk">
-      <nav className="icon-rail" aria-label="主导航">
-        <div className="icon-rail-top">
-          <button
-            type="button"
-            className={`icon-rail-btn ${panel === "compose" ? "icon-rail-btn-active" : ""}`}
-            data-tip="首页"
-            aria-label="首页"
-            aria-current={panel === "compose" ? "page" : undefined}
-            onClick={startNewCompose}
-          >
-            {iconRailHome}
-          </button>
-          <button
-            type="button"
-            className={`icon-rail-btn ${panel === "task" ? "icon-rail-btn-active" : ""}`}
-            data-tip="当前任务"
-            aria-label="当前任务"
-            aria-current={panel === "task" ? "page" : undefined}
-            onClick={goToTaskPanel}
-          >
-            {iconRailClock}
-          </button>
-          <button
-            type="button"
-            className={`icon-rail-btn ${panel === "workspace" ? "icon-rail-btn-active" : ""}`}
-            data-tip="资料库"
-            aria-label="资料库"
-            aria-current={panel === "workspace" ? "page" : undefined}
-            onClick={() => setPanel("workspace")}
-          >
-            {iconRailLibrary}
-          </button>
-          <button
-            type="button"
-            className={`icon-rail-btn ${panel === "schedules" ? "icon-rail-btn-active" : ""}`}
-            data-tip={unreadFailCount > 0 ? `自动化（${unreadFailCount} 条失败未读）` : "自动化"}
-            aria-label={unreadFailCount > 0 ? `自动化，${unreadFailCount} 条失败未读` : "自动化"}
-            aria-current={panel === "schedules" ? "page" : undefined}
-            onClick={() => {
-              setPanel("schedules");
-              refreshScheduleNotices().catch(() => undefined);
-            }}
-          >
-            {iconRailAutomate}
-            {unreadFailCount > 0 ? (
-              <span className="icon-rail-badge" aria-hidden>
-                {unreadFailCount > 9 ? "9+" : unreadFailCount}
-              </span>
-            ) : null}
-          </button>
-        </div>
-      </nav>
-
-      {taskRailOpen ? (
-        <>
-        <button type="button" className="fixed inset-0 left-[3.25rem] z-20 bg-black/20 md:hidden" aria-label="关闭任务列表" onClick={() => setTaskRailOpen(false)} />
-        <aside className="app-sidebar task-rail fixed bottom-0 left-[3.25rem] top-0 z-30 flex w-[15.5rem] max-w-[calc(100vw-3.25rem)] shrink-0 flex-col border-r soft-divider md:static md:z-auto lg:w-64">
-          <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-3">
-            <span className="section-label">任务</span>
-            <button type="button" className="btn-text ml-auto !text-xs md:hidden" onClick={() => setTaskRailOpen(false)}>收起</button>
-            <button
-              className="btn-text !text-xs"
-              type="button"
-              onClick={() => {
-                setManageMode((v) => !v);
-                setMergeIds([]);
-              }}
-            >
-              {manageMode ? "完成" : "管理"}
-            </button>
-          </div>
-          <div className="px-3 pb-2">
-            <input
-              className="field !mt-0 !py-1.5 text-xs"
-              placeholder="搜索任务标题或内容…"
-              value={taskQueryDraft}
-              onChange={(e) => setTaskQueryDraft(e.target.value)}
-              aria-label="搜索任务"
-            />
-            {taskQuery ? (
-              <p className="mt-1 text-[10px] text-[var(--faint)]">
-                含匹配的已归档 ·{" "}
-                <button type="button" className="btn-text !text-[10px]" onClick={() => setTaskQueryDraft("")}>
-                  清除
-                </button>
-              </p>
-            ) : null}
-          </div>
-          {manageMode ? (
-            <div className="flex items-center justify-between gap-2 px-3 pb-2">
-              <span className="text-[11px] text-[var(--faint)]">勾选 ≥2 条后合并</span>
-              <button
-                className="btn-text !text-xs"
-                type="button"
-                disabled={busy || mergeIds.length < 2}
-                onClick={() => onMergeTasks()}
-              >
-                合并{mergeIds.length >= 2 ? ` (${mergeIds.length})` : ""}
-              </button>
-            </div>
-          ) : null}
-          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
-            {(() => {
-              const searching = Boolean(taskQuery.trim());
-              // Search: show every hit flat (including merged children). Nesting under a
-              // non-matching parent would hide real hits or surface unrelated primaries.
-              const topTasks = searching
-                ? tasks
-                : tasks.filter((t) => t.status !== "merged");
-              const childrenOf = (parentId: string) =>
-                searching
-                  ? []
-                  : tasks.filter((t) => t.status === "merged" && t.merged_into_id === parentId);
-              if (topTasks.length === 0) {
-                return (
-                  <p className="px-2 text-xs leading-relaxed text-[var(--faint)]">
-                    {taskQuery ? "没有匹配的任务" : "还没有任务"}
-                  </p>
-                );
-              }
-              return topTasks.map((t) => {
-                const kids = childrenOf(t.id);
-                const hasBundle = !searching && (kids.length > 0 || (t.merged_from_ids || []).length > 0);
-                const expanded = expandedMergeIds.includes(t.id);
-                const canPick = manageMode;
-                const label = taskRailLabel(t, taskQuery);
-                const fullPrompt = searchablePrompt(t.user_prompt || "");
-                const tip = fullPrompt ? `${label}\n${fullPrompt.slice(0, 120)}` : label;
-                return (
-                  <div key={t.id} className="space-y-0.5">
-                    <div
-                      className={`task-row flex w-full items-center gap-1.5 ${
-                        panel === "task" && selected?.id === t.id ? "task-row-active" : ""
-                      }`}
-                    >
-                      {canPick ? (
-                        <input
-                          type="checkbox"
-                          className="shrink-0"
-                          checked={mergeIds.includes(t.id)}
-                          onChange={() => toggleMergeId(t.id)}
-                          aria-label={`选择 ${label}`}
-                        />
-                      ) : null}
-                      {hasBundle ? (
-                        <button
-                          type="button"
-                          className="shrink-0 px-0.5 text-[10px] text-[var(--faint)]"
-                          aria-label={expanded ? "收起已并入" : "展开已并入"}
-                          onClick={() => toggleExpandMerge(t.id)}
-                        >
-                          {expanded ? "▾" : "▸"}
-                        </button>
-                      ) : (
-                        <span className="inline-block w-3 shrink-0" />
-                      )}
-                      <button
-                        type="button"
-                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                        onClick={() => {
-                          if (hasBundle && !expanded) toggleExpandMerge(t.id);
-                          selectTask(t.id);
-                        }}
-                        title={tip}
-                      >
-                        <span className={`status-dot ${statusTone(t.status)}`} />
-                        <span className="min-w-0 flex-1 truncate text-sm">
-                          {label}
-                        </span>
-                        {t.status === "archived" ? (
-                          <span className="shrink-0 text-[10px] text-[var(--faint)]">归档</span>
-                        ) : t.status === "merged" && searching ? (
-                          <span className="shrink-0 text-[10px] text-[var(--faint)]">已并入</span>
-                        ) : hasBundle ? (
-                          <span className="shrink-0 text-[10px] text-[var(--faint)]">
-                            {kids.length || (t.merged_from_ids || []).length}
-                          </span>
-                        ) : null}
-                      </button>
-                    </div>
-                    {expanded && kids.length > 0
-                      ? kids.map((child) => {
-                          const childLabel = taskRailLabel(child, taskQuery);
-                          return (
-                          <button
-                            key={child.id}
-                            type="button"
-                            className={`task-row ml-4 flex w-[calc(100%-1rem)] items-center gap-2 ${
-                              panel === "task" && selected?.id === child.id ? "task-row-active" : ""
-                            }`}
-                            onClick={() => selectTask(child.id)}
-                            title={childLabel}
-                          >
-                            <span className={`status-dot ${statusTone(child.status)}`} />
-                            <span className="min-w-0 flex-1 truncate text-xs text-[var(--muted)]">
-                              {childLabel}
-                            </span>
-                          </button>
-                          );
-                        })
-                      : null}
-                  </div>
-                );
-              });
-            })()}
-          </div>
-        </aside>
-        </>
-      ) : null}
-
-      <div className="app-frame flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="app-topbar shrink-0 border-b soft-divider">
-          <div className="flex items-center gap-2.5 px-3 py-2.5 lg:px-4">
-            <button
-              type="button"
-              className="rail-toggle"
-              title={taskRailOpen ? "收起侧边栏" : "展开侧边栏"}
-              aria-label={taskRailOpen ? "收起侧边栏" : "展开侧边栏"}
-              aria-pressed={taskRailOpen}
-              onClick={() => toggleTaskRail()}
-            >
-              {sidebarToggleIcon}
-            </button>
-            <div className="min-w-0">
-              <p className="font-display truncate text-[15px] font-semibold tracking-tight text-[var(--ink)] leading-tight">
-                AI办公搭子
-              </p>
-              <p className="hidden text-[11px] leading-tight text-[var(--muted)] sm:block">本机调研工作台</p>
-            </div>
-            {!taskRailOpen ? (
-              <button
-                type="button"
-                className="new-chat-btn new-chat-btn-compact ml-1"
-                onClick={startNewCompose}
-                title="新建"
-              >
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path
-                    d="M8 3.2v9.6M3.2 8h9.6"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                  />
-                </svg>
-                新建
-              </button>
-            ) : null}
-            <div className="min-w-0 flex-1" />
-            <p className="hidden text-[11px] leading-relaxed text-[var(--faint)] sm:block sm:max-w-md sm:truncate sm:text-right">
-              {panel === "task" && selected?.model_label
-                ? `模型：${selected.model_label} · ${selected.model_name}`
-                : "选择适合任务的模型，开始处理工作。"}
-            </p>
-          </div>
-        </header>
-
+    <FusionShell panel={panel} title={selected?.title} tasks={tasks} onNavigate={navigatePanel}
+      onTask={id => { void selectTask(id); }} onNew={startNewCompose} onSearch={openTaskSearch}>
         <main className="content-area flex min-h-0 min-w-0 flex-1 flex-col">
         {panel !== "compose" ? (
         <header className="flex items-end justify-between gap-4 px-6 py-5 lg:px-10">
@@ -1777,7 +1568,7 @@ export default function HomePage() {
         </header>
         ) : null}
 
-        <div className={`flex min-h-0 flex-1 flex-col ${panel === "compose" ? "px-4 pb-4 lg:px-6 lg:pb-5" : "px-6 pb-6 lg:px-10 lg:pb-8"}`}>
+        <div data-panel={panel} className={`flex min-h-0 flex-1 flex-col ${panel === "compose" ? "" : "px-6 pb-6 lg:px-10 lg:pb-8"}`}>
           {error ? (
             <div className="alert-error mb-4 rounded-md px-4 py-3 text-sm">
               {error}
@@ -1790,239 +1581,22 @@ export default function HomePage() {
           ) : null}
 
           {panel === "compose" ? (
-            <div className="compose-stage">
-              <div className="compose-stage-center">
-                <h1 className="compose-welcome font-display">今天想办哪件差事？</h1>
-                <p className="compose-welcome-sub">选场景或直接说需求；左侧可进任务、资料库与自动化。</p>
-                <div
-                  className="scene-picker"
-                  onMouseLeave={() => setHoverSceneCategory("")}
-                >
-                  <div className="scene-cats" role="tablist" aria-label="场景大类">
-                    {sceneCategories.map((cat) => {
-                      const active = openSceneCategory === cat;
-                      return (
-                        <button
-                          key={cat}
-                          type="button"
-                          role="tab"
-                          aria-selected={active}
-                          className={active ? "scene-cat scene-cat-active" : "scene-cat"}
-                          onMouseEnter={() => setHoverSceneCategory(cat)}
-                          onFocus={() => setHoverSceneCategory(cat)}
-                          onClick={() =>
-                            setPinnedSceneCategory((prev) => (prev === cat ? "" : cat))
-                          }
-                        >
-                          {SCENE_CATEGORY_LABEL[cat] || cat}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {openCategoryScenes.length > 0 ? (
-                    <div className="scene-children-wrap">
-                      {sceneScroll.canUp ? (
-                        <button
-                          type="button"
-                          className="scene-scroll-btn scene-scroll-up"
-                          aria-label="向上查看更多场景"
-                          onClick={() => scrollScenePage(-1)}
-                        >
-                          <span aria-hidden>⌃</span>
-                        </button>
-                      ) : null}
-                      <div
-                        ref={sceneChildrenRef}
-                        className={
-                          "scene-children" +
-                          (sceneScroll.canUp ? " scene-children-has-prev" : "") +
-                          (sceneScroll.canDown ? " scene-children-has-more" : "")
-                        }
-                        role="tabpanel"
-                        onScroll={updateSceneScroll}
-                      >
-                        {openCategoryScenes.map((sc) => (
-                          <button
-                            key={sc.id}
-                            type="button"
-                            title={sc.blurb}
-                            className={
-                              activeSceneId === sc.id
-                                ? "scene-child scene-child-active"
-                                : "scene-child"
-                            }
-                            onClick={() => {
-                              if (activeSceneId === sc.id) {
-                                setDetectHint(null);
-                                setActiveSceneId("");
-                                setSkillId("");
-                                setExpertId("");
-                                setNeedsTableUpload(false);
-                                setShelfLocked(false);
-                                return;
-                              }
-                              void applyScene(sc);
-                            }}
-                          >
-                            <span className="scene-child-name">{sc.name}</span>
-                            <span className="scene-child-blurb">{sc.blurb}</span>
-                          </button>
-                        ))}
-                      </div>
-                      {sceneScroll.canDown ? (
-                        <>
-                          <div className="scene-children-fade" aria-hidden />
-                          <button
-                            type="button"
-                            className="scene-scroll-btn scene-scroll-down"
-                            aria-label="向下查看更多场景"
-                            onClick={() => scrollScenePage(1)}
-                          >
-                            <span aria-hidden>⌄</span>
-                          </button>
-                          {sceneScroll.moreCount > 0 ? (
-                            <p className="scene-more-hint">
-                              还有 {sceneScroll.moreCount} 个 · 下滑或点箭头
-                            </p>
-                          ) : null}
-                        </>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <p className="scene-picker-hint">把鼠标移到「调研 / 写稿 / 数据」上看下级场景</p>
-                  )}
-                </div>
-
-                {needsTableUpload || skillId === "table_analysis" ? (
-                  <div className="compose-extra mx-auto mt-4 w-full max-w-2xl space-y-3 rounded-md border soft-divider p-3">
-                    <div>
-                      <p className="text-sm font-medium text-[var(--ink)]">表格（开始前准备）</p>
-                      <p className="mt-1 text-xs text-[var(--muted)]">
-                        上传挂到本任务，或从资料库选表；报告请在任务页下载。
-                      </p>
-                    </div>
-                    <input
-                      type="file"
-                      accept=".csv,.xlsx"
-                      className="block w-full text-xs text-[var(--ink)]"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (!f) return;
-                        setPendingTableFiles([f]);
-                        setPendingWsTables([]);
-                        e.target.value = "";
-                      }}
-                    />
-                    {pendingTableFiles.length > 0 ? (
-                      <ul className="space-y-1 text-xs text-[var(--muted)]">
-                        {pendingTableFiles.map((f) => (
-                          <li key={f.name}>待上传：{f.name}</li>
-                        ))}
-                      </ul>
-                    ) : null}
-                    {wsRoot ? (
-                      <div className="space-y-2">
-                        <p className="text-xs text-[var(--faint)]">从资料库选表</p>
-                        <ul className="max-h-28 space-y-1 overflow-auto text-xs">
-                          {wsEntries
-                            .filter((e) => !e.is_dir && isTableFileName(e.name))
-                            .map((e) => {
-                              const on = pendingWsTables.includes(e.rel);
-                              return (
-                                <li key={e.rel}>
-                                  <button
-                                    type="button"
-                                    className={
-                                      on
-                                        ? "text-[var(--accent)] underline"
-                                        : "text-[var(--ink)] underline-offset-2 hover:underline"
-                                    }
-                                    onClick={() => {
-                                      setPendingWsTables((prev) =>
-                                        prev.includes(e.rel)
-                                          ? prev.filter((x) => x !== e.rel)
-                                          : [...prev, e.rel].slice(0, 3)
-                                      );
-                                      setPendingTableFiles([]);
-                                    }}
-                                  >
-                                    {on ? "已选 · " : ""}
-                                    {e.name}
-                                  </button>
-                                </li>
-                              );
-                            })}
-                          {wsEntries.filter((e) => !e.is_dir && isTableFileName(e.name)).length === 0 ? (
-                            <li className="text-[var(--faint)]">当前文件夹没有 csv/xlsx，可先去「资料库」上传。</li>
-                          ) : null}
-                        </ul>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-[var(--faint)]">
-                        资料库暂不可用，请先上传本地文件。
-                      </p>
-                    )}
-                    {pendingWsTables.length > 0 ? (
-                      <p className="text-xs text-[var(--muted)]">已选资料库：{pendingWsTables.join("、")}</p>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {showMore ? (
-                  <div className="mx-auto mt-3 w-full max-w-2xl space-y-2 rounded-md border soft-divider p-3">
-                    <p className="text-xs text-[var(--muted)]">可选，每行一个公开网页，最多 3 个。</p>
-                    <textarea
-                      className="field"
-                      rows={2}
-                      placeholder={"https://example.com/a\nhttps://example.com/b"}
-                      value={urls}
-                      onChange={(e) => setUrls(e.target.value)}
-                    />
-                  </div>
-                ) : null}
-              </div>
-
-              <div className="compose-bar-wrap">
-                <div className="compose-bar">
-                  <textarea
-                    className="compose-bar-input"
-                    rows={1}
-                    placeholder="用一句话说清要办的差事…"
-                    value={prompt}
-                    onChange={(e) => {
-                      setPrompt(e.target.value);
-                      setActiveSceneId("");
-                      setShelfLocked(false);
-                    }}
-                    onKeyDown={(e) => {
-                      // Enter 提交；Shift+Enter 换行。IME 组字/选词确认的 Enter 不得触发创建Task。
-                      if (e.key !== "Enter" || e.shiftKey) return;
-                      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-                      e.preventDefault();
-                      if (!busy && prompt.trim()) onCreate();
-                    }}
-                  />
-                  <div className="compose-bar-actions">
-                    <ModelPicker value={modelId} onChange={setModelId} disabled={busy} />
-                    <button type="button" className="btn-text !text-xs" onClick={() => setShowMore((v) => !v)}>
-                      {showMore ? "收起链接" : "上传链接"}
-                    </button>
-                    <button type="button" className="btn-text !text-xs" onClick={openShelf}>
-                      能力货架
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy || !prompt.trim()}
-                      onClick={onCreate}
-                      className="compose-send"
-                      aria-label="开始生成"
-                    >
-                      开始
-                    </button>
-                  </div>
-                </div>
-              </div>
-
+            <>
+              <FusionHome
+                tasks={tasks} loading={taskLoading} schedules={schedules} scenes={scenes}
+                onScene={scene => { void applyScene(scene); }} onTask={id => { void selectTask(id); }} onNavigate={navigatePanel}
+                composer={{
+                  prompt, onPrompt: value => { setPrompt(value); setActiveSceneId(""); if (!pendingTableFiles.some(file => isTableFileName(file.name))) setShelfLocked(false); },
+                  modelId, onModel: setModelId, files: pendingTableFiles, refs: pendingWsTables,
+                  onFiles: files => {
+                    setPendingTableFiles(files);
+                    if (files.some(file => isTableFileName(file.name))) { setNeedsTableUpload(true); setSkillId("table_analysis"); setActiveSceneId("table_analysis"); setShelfLocked(true); }
+                  },
+                  onRemoveRef: path => setPendingWsTables(prev => prev.filter(item => item !== path)),
+                  urls, onUrls: setUrls, busy, onSubmit: () => { void onCreate(); }, onError: setError, onShelf: openShelf,
+                  choice: experts.find(expert => expert.id === expertId)?.name || skills.find(skill => skill.id === skillId)?.name || "",
+                }}
+              />
               {showShelf && typeof document !== "undefined"
                 ? createPortal(
                     <div className="shelf-overlay" role="dialog" aria-modal="true" aria-label="能力货架">
@@ -2146,8 +1720,159 @@ export default function HomePage() {
                     document.body
                   )
                 : null}
+            </>
+          ) : null}
+
+          {panel === "tasks" ? <section className="panel-card mx-auto w-full max-w-5xl overflow-hidden p-4">
+          <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-3">
+            <span className="section-label">任务</span>
+            <button
+              className="btn-text !text-xs"
+              type="button"
+              onClick={() => {
+                setManageMode((v) => !v);
+                setMergeIds([]);
+              }}
+            >
+              {manageMode ? "完成" : "管理"}
+            </button>
+          </div>
+          <div className="px-3 pb-2">
+            <input
+              className="field !mt-0 !py-1.5 text-xs"
+              placeholder="搜索任务标题或内容…"
+              value={taskQueryDraft}
+              onChange={(e) => setTaskQueryDraft(e.target.value)}
+              aria-label="搜索任务列表"
+            />
+            {taskQuery ? (
+              <p className="mt-1 text-[10px] text-[var(--faint)]">
+                含匹配的已归档 ·{" "}
+                <button type="button" className="btn-text !text-[10px]" onClick={() => setTaskQueryDraft("")}>
+                  清除
+                </button>
+              </p>
+            ) : null}
+          </div>
+          {manageMode ? (
+            <div className="flex items-center justify-between gap-2 px-3 pb-2">
+              <span className="text-[11px] text-[var(--faint)]">勾选 ≥2 条后合并</span>
+              <button
+                className="btn-text !text-xs"
+                type="button"
+                disabled={busy || mergeIds.length < 2}
+                onClick={() => onMergeTasks()}
+              >
+                合并{mergeIds.length >= 2 ? ` (${mergeIds.length})` : ""}
+              </button>
             </div>
           ) : null}
+          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
+            {(() => {
+              const searching = Boolean(taskQuery.trim());
+              // Search: show every hit flat (including merged children). Nesting under a
+              // non-matching parent would hide real hits or surface unrelated primaries.
+              const topTasks = searching
+                ? tasks
+                : tasks.filter((t) => t.status !== "merged");
+              const childrenOf = (parentId: string) =>
+                searching
+                  ? []
+                  : tasks.filter((t) => t.status === "merged" && t.merged_into_id === parentId);
+              if (topTasks.length === 0) {
+                return (
+                  <p className="px-2 text-xs leading-relaxed text-[var(--faint)]">
+                    {taskQuery ? "没有匹配的任务" : "还没有任务"}
+                  </p>
+                );
+              }
+              return topTasks.map((t) => {
+                const kids = childrenOf(t.id);
+                const hasBundle = !searching && (kids.length > 0 || (t.merged_from_ids || []).length > 0);
+                const expanded = expandedMergeIds.includes(t.id);
+                const canPick = manageMode;
+                const label = taskRailLabel(t, taskQuery);
+                const fullPrompt = searchablePrompt(t.user_prompt || "");
+                const tip = fullPrompt ? `${label}\n${fullPrompt.slice(0, 120)}` : label;
+                return (
+                  <div key={t.id} className="space-y-0.5">
+                    <div
+                      className={`task-row flex w-full items-center gap-1.5 ${
+                        selected?.id === t.id ? "task-row-active" : ""
+                      }`}
+                    >
+                      {canPick ? (
+                        <input
+                          type="checkbox"
+                          className="shrink-0"
+                          checked={mergeIds.includes(t.id)}
+                          onChange={() => toggleMergeId(t.id)}
+                          aria-label={`选择 ${label}`}
+                        />
+                      ) : null}
+                      {hasBundle ? (
+                        <button
+                          type="button"
+                          className="shrink-0 px-0.5 text-[10px] text-[var(--faint)]"
+                          aria-label={expanded ? "收起已并入" : "展开已并入"}
+                          onClick={() => toggleExpandMerge(t.id)}
+                        >
+                          {expanded ? "▾" : "▸"}
+                        </button>
+                      ) : (
+                        <span className="inline-block w-3 shrink-0" />
+                      )}
+                      <button
+                        type="button"
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                        onClick={() => {
+                          if (hasBundle && !expanded) toggleExpandMerge(t.id);
+                          selectTask(t.id);
+                        }}
+                        title={tip}
+                      >
+                        <span className={`status-dot ${statusTone(t.status)}`} />
+                        <span className="min-w-0 flex-1 truncate text-sm">
+                          {label}
+                        </span>
+                        {t.status === "archived" ? (
+                          <span className="shrink-0 text-[10px] text-[var(--faint)]">归档</span>
+                        ) : t.status === "merged" && searching ? (
+                          <span className="shrink-0 text-[10px] text-[var(--faint)]">已并入</span>
+                        ) : hasBundle ? (
+                          <span className="shrink-0 text-[10px] text-[var(--faint)]">
+                            {kids.length || (t.merged_from_ids || []).length}
+                          </span>
+                        ) : null}
+                      </button>
+                    </div>
+                    {expanded && kids.length > 0
+                      ? kids.map((child) => {
+                          const childLabel = taskRailLabel(child, taskQuery);
+                          return (
+                          <button
+                            key={child.id}
+                            type="button"
+                            className={`task-row ml-4 flex w-[calc(100%-1rem)] items-center gap-2 ${
+                              selected?.id === child.id ? "task-row-active" : ""
+                            }`}
+                            onClick={() => selectTask(child.id)}
+                            title={childLabel}
+                          >
+                            <span className={`status-dot ${statusTone(child.status)}`} />
+                            <span className="min-w-0 flex-1 truncate text-xs text-[var(--muted)]">
+                              {childLabel}
+                            </span>
+                          </button>
+                          );
+                        })
+                      : null}
+                  </div>
+                );
+              });
+            })()}
+          </div>
+          </section> : null}
 
           {panel === "task" ? (
             selected ? (
@@ -2976,8 +2701,6 @@ export default function HomePage() {
           ) : null}
         </div>
       </main>
-      </div>
-
       {feishuChooserOpen && typeof document !== "undefined"
         ? createPortal(
             <div className="shelf-overlay" role="dialog" aria-modal="true" aria-label="导出到飞书">
@@ -3051,6 +2774,6 @@ export default function HomePage() {
           </div>
         </div>
       ) : null}
-    </div>
+    </FusionShell>
   );
 }
