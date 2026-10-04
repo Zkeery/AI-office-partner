@@ -51,7 +51,7 @@ def test_notify_prefs_api_and_mock_send_on_failed_run(client, monkeypatch):
     # 创建并打开「发飞书」
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "飞书通知自动化",
             "prompt": "测失败通知",
             "interval_minutes": 60,
@@ -95,7 +95,7 @@ def test_notify_off_and_schedule_flag_skip(client, monkeypatch):
 
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "关闭全局",
             "prompt": "不应发飞书",
             "interval_minutes": 30,
@@ -116,7 +116,7 @@ def test_notify_off_and_schedule_flag_skip(client, monkeypatch):
     client.put("/api/feishu/notify", json={"notify_on": "always"})
     r2 = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "未开单条",
             "prompt": "成功也不发",
             "interval_minutes": 30,
@@ -137,7 +137,7 @@ def test_notify_always_sends_on_success_mock(client):
     )
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "成功也推",
             "prompt": "成功路径",
             "interval_minutes": 60,
@@ -168,7 +168,7 @@ def test_notify_real_mode_without_credentials_skips(client, monkeypatch):
     )
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "无凭证",
             "prompt": "应跳过",
             "interval_minutes": 60,
@@ -201,7 +201,7 @@ def test_notify_prefs_validation(client):
 def test_schedule_patch_feishu_notify_fields(client):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "补丁飞书字段",
             "prompt": "x",
             "interval_minutes": 60,

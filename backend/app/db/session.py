@@ -24,6 +24,9 @@ def _ensure_schedule_columns() -> None:
         if not rows:
             return
         cols = {r[1] for r in rows}
+        for name, kind in (("model_id", "VARCHAR(80)"), ("model_name", "VARCHAR(200)")):
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE schedules ADD COLUMN {name} {kind}"))
         if "trigger_mode" not in cols:
             conn.execute(
                 text(

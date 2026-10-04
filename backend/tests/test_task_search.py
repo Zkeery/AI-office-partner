@@ -38,10 +38,10 @@ def test_task_search_archived_matches_prompt_not_generic_title(client, monkeypat
     get_settings.cache_clear()
 
     want = client.post(
-        "/api/tasks", json={"prompt": "独一无二的青柠周报搜索词", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "独一无二的青柠周报搜索词", "urls": []}
     ).json()["id"]
     noise = client.post(
-        "/api/tasks", json={"prompt": "最新归档干扰项芒果计划", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "最新归档干扰项芒果计划", "urls": []}
     ).json()["id"]
     client.post(f"/api/tasks/{want}/confirm", json={})
     client.post(f"/api/tasks/{noise}/confirm", json={})
@@ -84,10 +84,10 @@ def test_task_search_ignores_merge_note_titles(client, monkeypatch):
     get_settings.cache_clear()
 
     primary = client.post(
-        "/api/tasks", json={"prompt": "飞书导出验收主任务", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "飞书导出验收主任务", "urls": []}
     ).json()["id"]
     child = client.post(
-        "/api/tasks", json={"prompt": "普通能力说明一下", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "普通能力说明一下", "urls": []}
     ).json()["id"]
     for tid in (primary, child):
         client.post(f"/api/tasks/{tid}/confirm", json={})
@@ -144,10 +144,10 @@ def test_task_search_matches_report_body(client, monkeypatch, tmp_path):
     get_settings.cache_clear()
 
     tid = client.post(
-        "/api/tasks", json={"prompt": "写一份普通周报提纲", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "写一份普通周报提纲", "urls": []}
     ).json()["id"]
     noise = client.post(
-        "/api/tasks", json={"prompt": "另一份完全无关芒果纪要", "urls": []}
+        "/api/tasks", json={"model_id": "mock", "prompt": "另一份完全无关芒果纪要", "urls": []}
     ).json()["id"]
     for x in (tid, noise):
         client.post(f"/api/tasks/{x}/confirm", json={})

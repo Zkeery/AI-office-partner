@@ -4,8 +4,15 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.services import catalog as catalog_service
+from app.core.config import get_settings
+from app.services.models import list_models
 
 router = APIRouter(prefix="/api", tags=["catalog"])
+
+
+@router.get("/models")
+def models():
+    return {"items": list_models(get_settings())}
 
 
 @router.get("/skills")

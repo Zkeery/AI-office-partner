@@ -71,7 +71,7 @@ def test_detect_scene_policy(client):
 def test_policy_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "解读某地数据保护新规对业务的影响",
             "urls": [],
             "skill_id": "policy_brief",
@@ -118,7 +118,7 @@ def test_detect_scene_proposal(client):
 def test_email_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "写邮件：通知客户下周演示改期",
             "urls": [],
             "skill_id": "email_draft",
@@ -135,7 +135,7 @@ def test_email_skill_plan(client):
 def test_proposal_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "起草客户成功体系落地的方案模板",
             "urls": [],
             "skill_id": "proposal_template",
@@ -152,7 +152,7 @@ def test_proposal_skill_plan(client):
 def test_weekly_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "写周报：本周完成登录改版，下周做埋点",
             "urls": [],
             "skill_id": "weekly_report",
@@ -199,7 +199,7 @@ def test_detect_scene_internal_notice(client):
 def test_speech_script_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "写发言稿：周会口头汇报本周交付",
             "urls": [],
             "skill_id": "speech_script",
@@ -218,7 +218,7 @@ def test_speech_script_skill_plan(client):
 def test_event_retro_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "活动复盘：春季开放日",
             "urls": [],
             "skill_id": "event_retro",
@@ -237,7 +237,7 @@ def test_event_retro_skill_plan(client):
 def test_internal_notice_skill_plan(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "内部通知：下周一提交考勤表",
             "urls": [],
             "skill_id": "internal_notice",
@@ -256,7 +256,7 @@ def test_internal_notice_skill_plan(client):
 def test_table_analysis_csv_upload(client, tmp_path):
     create = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "基于上传表格分析销售情况",
             "urls": [],
             "skill_id": "table_analysis",

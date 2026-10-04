@@ -37,7 +37,7 @@ def test_workspace_set_list_deny_export(client, tmp_path):
     preview = client.get("/api/workspace/file", params={"rel": "note.txt"}).json()
     assert "份额上升" in preview["content"]
 
-    r = client.post("/api/tasks", json={"prompt": "结合工作区", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "结合工作区", "urls": []})
     task_id = r.json()["id"]
     client.post(f"/api/tasks/{task_id}/confirm", json={})
     import time
@@ -64,7 +64,7 @@ def test_workspace_refs_attach(client, tmp_path):
     (root / "brief.md").write_text("# 简报\n份额上升明显", encoding="utf-8")
     assert client.put("/api/workspace", json={"root": str(root)}).status_code == 200
 
-    r = client.post("/api/tasks", json={"prompt": "读工作区简报", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "读工作区简报", "urls": []})
     task_id = r.json()["id"]
     assert r.json()["status"] == "plan_ready"
 
@@ -162,7 +162,7 @@ def test_execute_default_skips_workspace_dump(client, tmp_path, monkeypatch):
 
     r = client.post(
         "/api/tasks",
-        json={"prompt": "写一份本周工作周报：完成点验、梳理归档", "urls": []},
+        json={"model_id": "mock", "prompt": "写一份本周工作周报：完成点验、梳理归档", "urls": []},
     )
     assert r.status_code == 200
     task_id = r.json()["id"]
@@ -203,7 +203,7 @@ def test_execute_with_workspace_refs_still_uses_them(client, tmp_path, monkeypat
 
     monkeypatch.setattr("app.services.tasks._write_report", capture_write)
 
-    r = client.post("/api/tasks", json={"prompt": "根据简报写要点", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "根据简报写要点", "urls": []})
     task_id = r.json()["id"]
     attached = client.post(
         f"/api/tasks/{task_id}/workspace-refs",

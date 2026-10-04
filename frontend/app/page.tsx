@@ -4,8 +4,6 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Expert,
-  HookTokenRotate,
-  RuntimeHealth,
   Schedule,
   ScheduleNotice,
   ScheduleRun,
@@ -22,15 +20,12 @@ import {
   detectScene,
   exportToFeishu,
   FeishuExportResult,
-  FeishuNotifySettings,
   FeishuOAuthStatus,
   disconnectFeishuOAuth,
   feishuOAuthStartUrl,
-  getFeishuNotifySettings,
   getFeishuOAuthStatus,
   mockConnectFeishuOAuth,
   getReport,
-  getRuntimeHealth,
   getWorkspace,
   listExperts,
   listScenes,
@@ -43,23 +38,21 @@ import {
   mergeTasks,
   patchSchedule,
   pauseTask,
-  putFeishuNotifySettings,
   readWorkspaceFile,
   replanTask,
   reportDocxUrl,
   reportPptxUrl,
   reportXlsxUrl,
   resumeTask,
-  rewriteReport,
-  rotateHookToken,
   runScheduleNow,
-  scheduleWebhookUrl,
   unarchiveTask,
   uploadFile,
   uploadWorkspaceTable,
 } from "@/lib/api";
 import { exportLabel, type ExportKind } from "@/lib/export-prefs";
 import { linkifyReport } from "@/lib/linkify-report";
+import { ReportWorkbench } from "@/components/ReportWorkbench";
+import { ModelPicker } from "@/components/ModelPicker";
 import {
   ackRunIds,
   formatNoticeLine,
@@ -154,6 +147,9 @@ const STATUS_LABEL: Record<string, string> = {
   failed: "失败",
   merged: "已合并",
   archived: "已归档",
+  pending: "待执行",
+  done: "已完成",
+  skipped: "已跳过",
 };
 
 const SCENE_CATEGORY_ORDER = ["research", "writing", "data"] as const;
@@ -164,7 +160,7 @@ const SCENE_CATEGORY_LABEL: Record<string, string> = {
 };
 
 function statusTone(status: string): string {
-  if (status === "succeeded") return "bg-[var(--accent)]";
+  if (status === "succeeded" || status === "done") return "bg-[var(--accent)]";
   if (status === "failed") return "bg-[var(--danger)]";
   if (status === "running" || status === "planning") return "bg-[#6e6b7a]";
   if (status === "paused") return "bg-[#9a97a8]";
@@ -275,19 +271,13 @@ export default function HomePage() {
   });
   const [detectHint, setDetectHint] = useState<SceneDetect | null>(null);
   const [skillId, setSkillId] = useState("");
+  const [modelId, setModelId] = useState("");
   const [expertId, setExpertId] = useState("");
   const [shelfLocked, setShelfLocked] = useState(false);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [expandedRunScheduleId, setExpandedRunScheduleId] = useState<string | null>(null);
   const [scheduleRuns, setScheduleRuns] = useState<ScheduleRun[]>([]);
   const [runsLoading, setRunsLoading] = useState(false);
-  const [expandedHookScheduleId, setExpandedHookScheduleId] = useState<string | null>(null);
-  const [hookReveal, setHookReveal] = useState<HookTokenRotate | null>(null);
-  const [hookCopyTip, setHookCopyTip] = useState("");
-  const [feishuNotify, setFeishuNotify] = useState<FeishuNotifySettings | null>(null);
-  const [feishuNotifyChatDraft, setFeishuNotifyChatDraft] = useState("");
-  const [feishuNotifySaving, setFeishuNotifySaving] = useState(false);
-  const [schedFeishuNotify, setSchedFeishuNotify] = useState(false);
   const [scheduleNotices, setScheduleNotices] = useState<ScheduleNotice[]>([]);
   const [ackedRunIds, setAckedRunIds] = useState<Set<string>>(() => new Set());
   const [schedToast, setSchedToast] = useState<ScheduleNotice | null>(null);
@@ -298,6 +288,7 @@ export default function HomePage() {
   const [schedTriggerMode, setSchedTriggerMode] = useState<"interval" | "on_task_succeeded">("interval");
   const [schedListenId, setSchedListenId] = useState("");
   const [schedSkillId, setSchedSkillId] = useState("");
+  const [schedModelId, setSchedModelId] = useState("");
   const [schedExpertId, setSchedExpertId] = useState("");
   const [showMore, setShowMore] = useState(false);
   const [showSchedForm, setShowSchedForm] = useState(false);
@@ -316,7 +307,6 @@ export default function HomePage() {
   const [manageMode, setManageMode] = useState(false);
   const [mergeIds, setMergeIds] = useState<string[]>([]);
   const [expandedMergeIds, setExpandedMergeIds] = useState<string[]>([]);
-  const [runtime, setRuntime] = useState<RuntimeHealth | null>(null);
   const [feishuExport, setFeishuExport] = useState<FeishuExportResult | null>(null);
   const [feishuCopyTip, setFeishuCopyTip] = useState("");
   const [feishuOAuth, setFeishuOAuth] = useState<FeishuOAuthStatus | null>(null);
@@ -324,7 +314,6 @@ export default function HomePage() {
   const [feishuChooserOpen, setFeishuChooserOpen] = useState(false);
   const [feishuMoreOpen, setFeishuMoreOpen] = useState(false);
   const [copyReportTip, setCopyReportTip] = useState("");
-  const [showMoreExports, setShowMoreExports] = useState(false);
   const [activeExportKind, setActiveExportKind] = useState<ExportKind>("md");
 
   async function refreshWorkspace(rel?: string) {
@@ -343,15 +332,6 @@ export default function HomePage() {
     setSchedules(await listSchedules());
   }
 
-  async function refreshFeishuNotify() {
-    try {
-      const s = await getFeishuNotifySettings();
-      setFeishuNotify(s);
-      setFeishuNotifyChatDraft(s.chat_id || "");
-    } catch {
-      /* soft */
-    }
-  }
 
 
   async function refreshFeishuOAuth() {
@@ -403,7 +383,7 @@ export default function HomePage() {
   }
 
   async function onDisconnectFeishu() {
-    if (!window.confirm("断开飞书账号？之后导出将改用应用空间兜底（若已配置应用凭证）。")) {
+    if (!window.confirm("断开飞书账号？之后导出到飞书需要重新连接账号。")) {
       return;
     }
     setFeishuOAuthBusy(true);
@@ -418,43 +398,6 @@ export default function HomePage() {
     }
   }
 
-  async function saveFeishuNotify(patch: {
-    notify_on?: "off" | "failed" | "always";
-    chat_id?: string;
-  }) {
-    setFeishuNotifySaving(true);
-    setError("");
-    try {
-      const s = await putFeishuNotifySettings(patch);
-      setFeishuNotify(s);
-      if (patch.chat_id !== undefined) setFeishuNotifyChatDraft(s.chat_id || "");
-    } catch (e: any) {
-      setError(e.message || String(e));
-    } finally {
-      setFeishuNotifySaving(false);
-    }
-  }
-
-  function formatFeishuLatestLine(): string {
-    const latest = feishuNotify?.recent?.[0];
-    if (!latest) return "最近一次：还没有";
-    const mode =
-      latest.mock || latest.status === "mocked"
-        ? "模拟"
-        : latest.status === "sent"
-          ? "真实"
-          : feishuNotify?.feishu_mock
-            ? "模拟"
-            : "真实";
-    const outcome =
-      latest.status === "skipped"
-        ? "跳过"
-        : latest.status === "mocked" || latest.status === "sent"
-          ? "成功"
-          : latest.message || latest.status || "—";
-    const when = latest.sent_at ? latest.sent_at.replace("T", " ").slice(0, 19) : "—";
-    return `最近一次：${mode} · ${outcome} · ${when}`;
-  }
 
   async function refreshScheduleNotices(opts?: { toastNewestUnreadFail?: boolean }) {
     try {
@@ -569,7 +512,6 @@ export default function HomePage() {
     refresh().catch((e) => setError(String(e.message || e)));
     refreshWorkspace().catch(() => undefined);
     refreshSchedules().catch(() => undefined);
-    refreshFeishuNotify().catch(() => undefined);
     refreshFeishuOAuth().catch(() => undefined);
     try {
       setAckedRunIds(loadAckedRunIds());
@@ -577,9 +519,6 @@ export default function HomePage() {
       /* ignore */
     }
     refreshScheduleNotices({ toastNewestUnreadFail: true }).catch(() => undefined);
-    getRuntimeHealth()
-      .then(setRuntime)
-      .catch(() => setRuntime(null));
     Promise.all([listSkills(), listExperts()])
       .then(([s, e]) => {
         setSkills(s);
@@ -600,6 +539,14 @@ export default function HomePage() {
   }, []);
 
   /* schedule-notice-poll: soft refresh so interval 跑次失败可站内可见 */
+  useEffect(() => {
+    const mobile = window.matchMedia("(max-width: 767px)");
+    const collapseOnMobile = () => { if (mobile.matches) setTaskRailOpen(false); };
+    collapseOnMobile();
+    mobile.addEventListener("change", collapseOnMobile);
+    return () => mobile.removeEventListener("change", collapseOnMobile);
+  }, []);
+
   useEffect(() => {
     const tick = () => {
       refreshScheduleNotices().catch(() => undefined);
@@ -628,6 +575,7 @@ export default function HomePage() {
   }
 
   function startNewCompose() {
+    setModelId("");
     setTaskBackTo(null);
     setPanel("compose");
     setSelected(null);
@@ -648,7 +596,6 @@ export default function HomePage() {
     setFeishuChooserOpen(false);
     setFeishuMoreOpen(false);
     setCopyReportTip("");
-    setShowMoreExports(false);
     setActiveExportKind("md");
   }
 
@@ -718,13 +665,6 @@ export default function HomePage() {
       />
     </svg>
   );
-  const iconRailMore = (
-    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
-      <circle cx="5" cy="10" r="1.15" fill="currentColor" />
-      <circle cx="10" cy="10" r="1.15" fill="currentColor" />
-      <circle cx="15" cy="10" r="1.15" fill="currentColor" />
-    </svg>
-  );
 
   function goToTaskPanel() {
     toggleTaskRail(true);
@@ -750,13 +690,17 @@ export default function HomePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskQuery]);
 
+  const selectedTaskId = selected?.id;
+  const selectedTaskStatus = selected?.status;
+  const latestRefresh = useRef(refresh);
+  useEffect(() => { latestRefresh.current = refresh; });
   useEffect(() => {
-    if (!selected || !["running", "planning"].includes(selected.status)) return;
+    if (!selectedTaskId || !selectedTaskStatus || !["running", "planning"].includes(selectedTaskStatus)) return;
     const timer = setInterval(() => {
-      refresh(selected.id).catch(() => undefined);
+      latestRefresh.current(selectedTaskId).catch(() => undefined);
     }, 1000);
     return () => clearInterval(timer);
-  }, [selected?.id, selected?.status]);
+  }, [selectedTaskId, selectedTaskStatus]);
 
   useEffect(() => {
     const text = prompt.trim();
@@ -790,6 +734,7 @@ export default function HomePage() {
   }, [prompt, scenes, shelfLocked]);
 
   async function selectTask(id: string, opts?: { backTo?: Panel }) {
+    if (window.matchMedia("(max-width: 767px)").matches) setTaskRailOpen(false);
     const backTo = opts?.backTo ?? null;
     setTaskBackTo(backTo);
     if (backTo) {
@@ -802,7 +747,6 @@ export default function HomePage() {
     setFeishuChooserOpen(false);
     setFeishuMoreOpen(false);
     setCopyReportTip("");
-    setShowMoreExports(false);
     setActiveExportKind("md");
     await refresh(id);
   }
@@ -875,6 +819,7 @@ export default function HomePage() {
   }
 
   async function onCreate() {
+    if (!modelId) { setError("请先选择本次任务使用的模型。"); return; }
     setBusy(true);
     setError("");
     try {
@@ -895,6 +840,7 @@ export default function HomePage() {
         return;
       }
       const t = await createTask(prompt, urlList, {
+        model_id: modelId,
         skill_id: effectiveSkill,
         expert_id: effectiveExpert,
       });
@@ -1128,6 +1074,7 @@ export default function HomePage() {
 
   async function onCreateSchedule() {
     if (!schedPrompt.trim()) return;
+    if (!schedModelId) { setError("请先选择自动化使用的模型。"); return; }
     if (schedTriggerMode === "on_task_succeeded" && !schedListenId) {
       setError("请选择要监听的自动化（某条成功后再跑本条）");
       return;
@@ -1136,6 +1083,7 @@ export default function HomePage() {
     setError("");
     try {
       await createSchedule({
+        model_id: schedModelId,
         name: schedName.trim() || "自动化",
         prompt: schedPrompt.trim(),
         interval_minutes: Math.max(1, Number(schedInterval) || 60),
@@ -1144,14 +1092,12 @@ export default function HomePage() {
         trigger_mode: schedTriggerMode,
         listen_schedule_id:
           schedTriggerMode === "on_task_succeeded" ? schedListenId || undefined : undefined,
-        feishu_notify: schedFeishuNotify,
       });
       setSchedPrompt("");
       setSchedName("自动化周报");
       setSchedInterval(60);
       setSchedTriggerMode("interval");
       setSchedListenId("");
-      setSchedFeishuNotify(false);
       setShowSchedForm(false);
       await refreshSchedules();
     } catch (e: any) {
@@ -1162,9 +1108,9 @@ export default function HomePage() {
   }
 
   function openSchedForm() {
+    setSchedModelId("");
     setSchedTriggerMode("interval");
     setSchedListenId("");
-    setSchedFeishuNotify(false);
     setShowSchedForm(true);
   }
 
@@ -1388,44 +1334,6 @@ export default function HomePage() {
     return trigger || "—";
   }
 
-  function toggleScheduleHook(scheduleId: string) {
-    if (expandedHookScheduleId === scheduleId) {
-      setExpandedHookScheduleId(null);
-      setHookReveal(null);
-      setHookCopyTip("");
-      return;
-    }
-    setExpandedHookScheduleId(scheduleId);
-    setHookReveal(null);
-    setHookCopyTip("");
-  }
-
-  async function copyHookText(label: string, value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      setHookCopyTip(`已复制${label}`);
-      window.setTimeout(() => setHookCopyTip(""), 2000);
-    } catch {
-      setHookCopyTip("复制失败，请手动全选");
-      window.setTimeout(() => setHookCopyTip(""), 2500);
-    }
-  }
-
-  async function onRotateHookToken(scheduleId: string) {
-    setBusy(true);
-    setError("");
-    setHookCopyTip("");
-    try {
-      const rotated = await rotateHookToken(scheduleId);
-      setHookReveal(rotated);
-      setExpandedHookScheduleId(scheduleId);
-      await refreshSchedules();
-    } catch (e: any) {
-      setError(e.message || String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   const visibleWorkspaceEntries = wsEntries
     .filter((e) => {
@@ -1548,6 +1456,10 @@ export default function HomePage() {
             ))}
           </select>
         </label>
+        <div className="text-sm text-[var(--muted)]">
+          <p className="mb-2">运行模型（必选）</p>
+          <ModelPicker value={schedModelId} onChange={setSchedModelId} disabled={busy} />
+        </div>
         <label className="text-sm text-[var(--muted)]">
           专家（可选）
           <select className="field" value={schedExpertId} onChange={(e) => setSchedExpertId(e.target.value)}>
@@ -1558,20 +1470,6 @@ export default function HomePage() {
               </option>
             ))}
           </select>
-        </label>
-        <label className="flex items-start gap-2 text-sm text-[var(--muted)]">
-          <input
-            type="checkbox"
-            className="mt-1"
-            checked={schedFeishuNotify}
-            onChange={(e) => setSchedFeishuNotify(e.target.checked)}
-          />
-          <span>
-            这条也发飞书群
-            <span className="mt-0.5 block text-xs text-[var(--faint)]">
-              跟上方设置走；可先模拟
-            </span>
-          </span>
         </label>
       </div>
       <div className="flex flex-wrap gap-2 pt-1">
@@ -1645,22 +1543,16 @@ export default function HomePage() {
               </span>
             ) : null}
           </button>
-          <button
-            type="button"
-            className="icon-rail-btn icon-rail-btn-muted"
-            data-tip="更多"
-            aria-label="更多"
-            disabled
-          >
-            {iconRailMore}
-          </button>
         </div>
       </nav>
 
       {taskRailOpen ? (
-        <aside className="app-sidebar task-rail flex w-[15.5rem] shrink-0 flex-col border-r soft-divider lg:w-64">
+        <>
+        <button type="button" className="fixed inset-0 left-[3.25rem] z-20 bg-black/20 md:hidden" aria-label="关闭任务列表" onClick={() => setTaskRailOpen(false)} />
+        <aside className="app-sidebar task-rail fixed bottom-0 left-[3.25rem] top-0 z-30 flex w-[15.5rem] max-w-[calc(100vw-3.25rem)] shrink-0 flex-col border-r soft-divider md:static md:z-auto lg:w-64">
           <div className="flex items-center justify-between gap-2 px-3 pb-2 pt-3">
             <span className="section-label">任务</span>
+            <button type="button" className="btn-text ml-auto !text-xs md:hidden" onClick={() => setTaskRailOpen(false)}>收起</button>
             <button
               className="btn-text !text-xs"
               type="button"
@@ -1808,6 +1700,7 @@ export default function HomePage() {
             })()}
           </div>
         </aside>
+        </>
       ) : null}
 
       <div className="app-frame flex min-h-0 min-w-0 flex-1 flex-col">
@@ -1849,16 +1742,9 @@ export default function HomePage() {
             ) : null}
             <div className="min-w-0 flex-1" />
             <p className="hidden text-[11px] leading-relaxed text-[var(--faint)] sm:block sm:max-w-md sm:truncate sm:text-right">
-              {runtime
-                ? [
-                    runtime.llm_mock || !runtime.llm_configured ? "模型：模拟/未配置" : `模型：${runtime.llm_model || "已接通"}`,
-                    runtime.search_mock
-                      ? "检索：模拟"
-                      : runtime.search_configured
-                        ? "检索：真实"
-                        : "检索：未配 Key（研类会报错）",
-                  ].join(" · ")
-                : "内容会发给已配置的云端模型推理；本产品不用于训练。"}
+              {panel === "task" && selected?.model_label
+                ? `模型：${selected.model_label} · ${selected.model_name}`
+                : "选择适合任务的模型，开始处理工作。"}
             </p>
           </div>
         </header>
@@ -1880,7 +1766,7 @@ export default function HomePage() {
               <p className="mt-1 text-sm text-[var(--muted)]">上传或选用表格。</p>
             ) : null}
             {panel === "schedules" && !showSchedForm ? (
-              <p className="mt-1 text-sm text-[var(--muted)]">让自动化按时跑；跑完后把结果发到飞书群提醒你（现在可先模拟）。</p>
+              <p className="mt-1 text-sm text-[var(--muted)]">让重复工作按计划完成，在这里查看执行状态与结果。</p>
             ) : null}
           </div>
           {panel === "schedules" && schedules.length > 0 && !showSchedForm ? (
@@ -2073,7 +1959,7 @@ export default function HomePage() {
                       </div>
                     ) : (
                       <p className="text-xs text-[var(--faint)]">
-                        尚未设置资料库。可先上传本地文件，或到「资料库」设置文件夹后再选表。
+                        资料库暂不可用，请先上传本地文件。
                       </p>
                     )}
                     {pendingWsTables.length > 0 ? (
@@ -2117,6 +2003,7 @@ export default function HomePage() {
                     }}
                   />
                   <div className="compose-bar-actions">
+                    <ModelPicker value={modelId} onChange={setModelId} disabled={busy} />
                     <button type="button" className="btn-text !text-xs" onClick={() => setShowMore((v) => !v)}>
                       {showMore ? "收起链接" : "上传链接"}
                     </button>
@@ -2265,6 +2152,7 @@ export default function HomePage() {
           {panel === "task" ? (
             selected ? (
               <div className="task-detail-stage mx-auto w-full max-w-3xl space-y-6">
+                <p className="text-xs text-[var(--muted)]">本次模型：{selected.model_label ? `${selected.model_label} · ${selected.model_name}` : "历史配置（创建时未记录型号）"}</p>
                 {!(report || selected.has_report) ? (
                   <div className="flex flex-wrap items-center gap-2 text-sm text-[var(--muted)]">
                     <span className="inline-flex items-center gap-1.5">
@@ -2462,11 +2350,10 @@ export default function HomePage() {
 
                 {(selected.user_prompt ||
                   selected.plan ||
-                  (selected.steps && selected.steps.length > 0)) &&
-                selected.status !== "succeeded" ? (
+                  (selected.steps && selected.steps.length > 0)) ? (
                   <details className="text-sm text-[var(--muted)]">
                     <summary className="cursor-pointer select-none text-xs text-[var(--faint)]">
-                      过程详情（可选，一般不用看）
+                      执行记录与结果依据
                     </summary>
                     {selected.user_prompt ? (
                       <div className="mt-3">
@@ -2499,6 +2386,8 @@ export default function HomePage() {
                               <span>
                                 #{s.seq} {s.name}
                                 <span className="ml-2 text-[11px]">{STATUS_LABEL[s.status] || s.status}</span>
+                                {s.detail?.evidence ? <span className="mt-1 block text-xs text-[var(--muted)]">{s.detail.evidence}</span> : null}
+                                {s.detail?.summary ? <span className="mt-1 block whitespace-pre-wrap text-xs text-[var(--muted)]">{s.detail.summary}</span> : null}
                               </span>
                             </li>
                           ))}
@@ -2584,7 +2473,7 @@ export default function HomePage() {
                             title={
                               feishuOAuth?.connected
                                 ? "导出到「我的」云文档"
-                                : "未连接时可去连接，或先用应用空间导出"
+                                : "连接飞书账号后导出到「我的」云文档"
                             }
                           >
                             {feishuOAuthBusy ? "连接中…" : "导出到飞书"}
@@ -2612,15 +2501,6 @@ export default function HomePage() {
                                     type="button"
                                     role="menuitem"
                                     className="feishu-more-item"
-                                    disabled={busy || !report || selected.status !== "succeeded"}
-                                    onClick={() => void doExportFeishu(true)}
-                                  >
-                                    改用应用空间
-                                  </button>
-                                  <button
-                                    type="button"
-                                    role="menuitem"
-                                    className="feishu-more-item"
                                     disabled={busy || feishuOAuthBusy}
                                     onClick={() => {
                                       setFeishuMoreOpen(false);
@@ -2629,71 +2509,15 @@ export default function HomePage() {
                                   >
                                     断开连接
                                   </button>
-                                  {feishuOAuth.redirect_uri ? (
-                                    <button
-                                      type="button"
-                                      role="menuitem"
-                                      className="feishu-more-item"
-                                      title="须与开放平台「安全设置→重定向 URL」完全一致"
-                                      onClick={async () => {
-                                        const u = feishuOAuth.redirect_uri;
-                                        try {
-                                          await navigator.clipboard.writeText(u);
-                                          setFeishuCopyTip("已复制回调地址，去开放平台粘贴登记");
-                                          window.setTimeout(() => setFeishuCopyTip(""), 2500);
-                                          setFeishuMoreOpen(false);
-                                        } catch {
-                                          setError(`请手动复制回调地址：${u}`);
-                                        }
-                                      }}
-                                    >
-                                      复制回调地址
-                                    </button>
-                                  ) : null}
                                 </div>
                               ) : null}
                             </>
                           ) : null}
                         </span>
-                        <button
-                          type="button"
-                          className="btn-text !text-xs"
-                          onClick={() => setShowMoreExports((v) => !v)}
-                        >
-                          {showMoreExports ? "收起更多" : "更多"}
-                        </button>
                         {copyReportTip ? (
                           <span className="text-xs text-[var(--accent)]">{copyReportTip}</span>
                         ) : null}
                       </div>
-                      {showMoreExports ? (
-                        <div className="flex flex-wrap gap-2 border-t soft-divider pt-3">
-                          <button
-                            type="button"
-                            className="btn-ghost !py-1.5 text-xs"
-                            disabled={busy || !report || selected.status !== "succeeded"}
-                            onClick={async () => {
-                              const instruction = window.prompt(
-                                "改写指令（例如：写得更短、加强竞品对比）",
-                                "写得更短一些，突出结论"
-                              );
-                              if (!instruction || !instruction.trim()) return;
-                              setBusy(true);
-                              setError("");
-                              try {
-                                await rewriteReport(selected.id, instruction.trim());
-                                await refresh(selected.id);
-                              } catch (e: any) {
-                                setError(e.message || String(e));
-                              } finally {
-                                setBusy(false);
-                              }
-                            }}
-                          >
-                            改写报告
-                          </button>
-                        </div>
-                      ) : null}
                       {feishuExport ? (
                         <div className="panel-card space-y-2 p-3 text-sm">
                           <p className="font-medium text-[var(--ink)]">
@@ -2744,6 +2568,15 @@ export default function HomePage() {
                         </div>
                       ) : null}
                     </div>
+                    {report ? <ReportWorkbench
+                      key={selected.id}
+                      taskId={selected.id}
+                      report={report}
+                      editable={selected.status === "succeeded"}
+                      busy={busy}
+                      onBusyChange={setBusy}
+                      onChanged={() => refresh(selected.id)}
+                    /> : null}
                     {report ? (
                       <div className="task-report-body text-[14px] leading-relaxed text-[var(--ink)]">{linkifyReport(report)}</div>
                     ) : (
@@ -2860,7 +2693,7 @@ export default function HomePage() {
                         ? wsFilter === "tables"
                           ? "没有表格。可上传 csv/xlsx，或切到「全部」。"
                           : "没有匹配的材料。"
-                        : "资料目录尚未配置。"}
+                        : "资料库暂不可用，请先在新任务中上传文件。"}
                     </li>
                   ) : null}
                 </ul>
@@ -2919,66 +2752,6 @@ export default function HomePage() {
                   </ul>
                 </div>
               ) : null}
-              {!showSchedForm ? (
-                <div className="mb-4 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-4 space-y-3">
-                  <p className="text-sm text-[var(--ink)]">
-                    跑完后要不要把结果发到飞书群
-                    <span className="ml-1 text-xs text-[var(--muted)]">（现在可先模拟，不进真群）</span>
-                  </p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs text-[var(--muted)]">何时发</span>
-                    {(
-                      [
-                        ["off", "关闭"],
-                        ["failed", "只失败发"],
-                        ["always", "成功失败都发"],
-                      ] as const
-                    ).map(([value, label]) => (
-                      <button
-                        key={value}
-                        type="button"
-                        className={
-                          (feishuNotify?.notify_on || "failed") === value
-                            ? "btn-primary !px-2.5 !py-1 text-xs"
-                            : "btn-ghost !px-2.5 !py-1 text-xs"
-                        }
-                        disabled={feishuNotifySaving || busy}
-                        onClick={() => saveFeishuNotify({ notify_on: value })}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex flex-wrap items-end gap-2">
-                    <label className="min-w-[16rem] flex-1 text-xs text-[var(--muted)]">
-                      发给哪个群
-                      <span className="mt-0.5 block text-xs text-[var(--faint)]">
-                        模拟时可随便填；真发再填群 ID
-                      </span>
-                      <input
-                        className="field mt-1"
-                        value={feishuNotifyChatDraft}
-                        placeholder="群 ID，例如 oc_xxxx"
-                        onChange={(e) => setFeishuNotifyChatDraft(e.target.value)}
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      className="btn-ghost !px-3 !py-2 text-xs"
-                      disabled={feishuNotifySaving || busy}
-                      onClick={() => saveFeishuNotify({ chat_id: feishuNotifyChatDraft.trim() })}
-                    >
-                      {feishuNotifySaving ? "保存中…" : "保存群设置"}
-                    </button>
-                  </div>
-                  <p
-                    className={`text-xs ${feishuNotify?.recent?.[0] ? "text-[var(--muted)]" : "text-[var(--faint)]"}`}
-                    title={feishuNotify?.recent?.[0]?.text_preview || feishuNotify?.recent?.[0]?.message || ""}
-                  >
-                    {formatFeishuLatestLine()}
-                  </p>
-                </div>
-              ) : null}
               {showSchedForm ? (
                 <div className="space-y-4">{schedFormCard}</div>
               ) : schedules.length === 0 ? (
@@ -3024,6 +2797,7 @@ export default function HomePage() {
                               <div className="mt-0.5 truncate text-xs text-[var(--faint)]" title={s.prompt}>
                                 {s.prompt}
                               </div>
+                              <div className="mt-1 text-xs text-[var(--muted)]">模型：{s.model_name || "历史配置"}</div>
                             </td>
                             <td className="whitespace-nowrap text-[var(--muted)]" title={formatTriggerMode(s)}>
                               {formatTriggerMode(s)}
@@ -3072,7 +2846,6 @@ export default function HomePage() {
                                       await refreshSchedules();
                                       if (expandedRunScheduleId === s.id) await refreshExpandedRuns();
                                       await refreshScheduleNotices();
-                                      await refreshFeishuNotify();
                                       const notices = await listScheduleNotices({ limit: 5 });
                                       const mine = notices.find((n) => n.schedule_id === s.id);
                                       if (mine) showSchedToast(mine);
@@ -3082,7 +2855,6 @@ export default function HomePage() {
                                       await refreshSchedules();
                                       if (expandedRunScheduleId === s.id) await refreshExpandedRuns();
                                       await refreshScheduleNotices();
-                                      await refreshFeishuNotify();
                                       try {
                                         const notices = await listScheduleNotices({
                                           limit: 5,
@@ -3110,38 +2882,6 @@ export default function HomePage() {
                                 <button
                                   className="btn-ghost !px-2 !py-1 text-xs"
                                   disabled={busy}
-                                  onClick={() => toggleScheduleHook(s.id)}
-                                >
-                                  {expandedHookScheduleId === s.id ? "收起 Webhook" : "Webhook"}
-                                </button>
-                                <button
-                                  className="btn-ghost !px-2 !py-1 text-xs"
-                                  disabled={busy}
-                                  title={
-                                    s.feishu_notify
-                                      ? "开：这条跑完按上方设置发飞书"
-                                      : "关：这条跑完不发飞书"
-                                  }
-                                  onClick={async () => {
-                                    setBusy(true);
-                                    setError("");
-                                    try {
-                                      await patchSchedule(s.id, {
-                                        feishu_notify: !s.feishu_notify,
-                                      });
-                                      await refreshSchedules();
-                                    } catch (e: any) {
-                                      setError(e.message || String(e));
-                                    } finally {
-                                      setBusy(false);
-                                    }
-                                  }}
-                                >
-                                  {s.feishu_notify ? "飞书·开" : "飞书·关"}
-                                </button>
-                                <button
-                                  className="btn-ghost !px-2 !py-1 text-xs"
-                                  disabled={busy}
                                   onClick={async () => {
                                     await patchSchedule(s.id, { enabled: !s.enabled });
                                     await refreshSchedules();
@@ -3160,10 +2900,6 @@ export default function HomePage() {
                                       if (expandedRunScheduleId === s.id) {
                                         setExpandedRunScheduleId(null);
                                         setScheduleRuns([]);
-                                      }
-                                      if (expandedHookScheduleId === s.id) {
-                                        setExpandedHookScheduleId(null);
-                                        setHookReveal(null);
                                       }
                                       await refreshSchedules();
                                     } catch (e: any) {
@@ -3230,87 +2966,6 @@ export default function HomePage() {
                               </td>
                             </tr>
                           ) : null}
-                          {expandedHookScheduleId === s.id ? (
-                            <tr className="sched-runs-row">
-                              <td colSpan={7}>
-                                <div className="sched-runs-panel space-y-3">
-                                  <div className="text-xs font-semibold uppercase tracking-wide text-[var(--faint)]">
-                                    入站 Webhook（带密钥）
-                                  </div>
-                                  <p className="text-xs leading-relaxed text-[var(--muted)]">
-                                    给 Shortcuts / 本机脚本用：用 POST 打下面的地址，带上密钥，就会像「立即跑」一样触发本条自动化。
-                                    跑次来源会显示为 Webhook。只做入站，不会把结果推到外部。密钥请当密码保管，轮换后旧的立刻失效。
-                                  </p>
-                                  <div className="space-y-1">
-                                    <div className="text-xs text-[var(--faint)]">触发地址（可复制）</div>
-                                    <div className="flex flex-wrap items-center gap-2">
-                                      <code className="max-w-full break-all rounded bg-[var(--panel-2,rgba(0,0,0,0.04))] px-2 py-1 text-xs">
-                                        {scheduleWebhookUrl(s.id)}
-                                      </code>
-                                      <button
-                                        type="button"
-                                        className="btn-ghost !px-2 !py-1 text-xs"
-                                        onClick={() => copyHookText("地址", scheduleWebhookUrl(s.id))}
-                                      >
-                                        复制地址
-                                      </button>
-                                    </div>
-                                  </div>
-                                  <div className="text-xs leading-relaxed text-[var(--muted)]">
-                                    鉴权方式（二选一）：
-                                    <br />
-                                    1）Header：<code className="text-[var(--accent)]">X-Hook-Token: &lt;密钥&gt;</code>
-                                    <br />
-                                    2）查询参数：<code className="text-[var(--accent)]">?token=&lt;密钥&gt;</code>
-                                  </div>
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <button
-                                      type="button"
-                                      className="btn-primary !py-1.5 text-xs"
-                                      disabled={busy}
-                                      onClick={() => onRotateHookToken(s.id)}
-                                    >
-                                      {s.hook_configured ? "轮换密钥" : "生成密钥"}
-                                    </button>
-                                    <span className="text-xs text-[var(--faint)]">
-                                      {s.hook_configured
-                                        ? "已配置密钥（列表不显示明文；轮换后旧密钥失效）"
-                                        : "尚未生成密钥，外部调用会返回 401"}
-                                    </span>
-                                    {hookCopyTip && expandedHookScheduleId === s.id ? (
-                                      <span className="text-xs text-[var(--accent)]">{hookCopyTip}</span>
-                                    ) : null}
-                                  </div>
-                                  {hookReveal && hookReveal.id === s.id ? (
-                                    <div className="rounded border border-[var(--accent)]/30 bg-[var(--panel-2,rgba(0,0,0,0.03))] p-3 space-y-2">
-                                      <div className="text-xs font-medium text-[var(--accent)]">
-                                        新密钥（只显示这一次，请立即复制保存）
-                                      </div>
-                                      <div className="flex flex-wrap items-center gap-2">
-                                        <code className="max-w-full break-all rounded bg-black/5 px-2 py-1 text-xs">
-                                          {hookReveal.hook_token}
-                                        </code>
-                                        <button
-                                          type="button"
-                                          className="btn-ghost !px-2 !py-1 text-xs"
-                                          onClick={() => copyHookText("密钥", hookReveal.hook_token)}
-                                        >
-                                          复制密钥
-                                        </button>
-                                      </div>
-                                      <p className="text-xs text-[var(--muted)]">{hookReveal.usage_hint}</p>
-                                      <div className="text-xs text-[var(--faint)]">
-                                        示例：
-                                        <code className="ml-1 break-all">
-                                          {`curl -X POST '${scheduleWebhookUrl(s.id)}' -H 'X-Hook-Token: ${hookReveal.hook_token}'`}
-                                        </code>
-                                      </div>
-                                    </div>
-                                  ) : null}
-                                </div>
-                              </td>
-                            </tr>
-                          ) : null}
                         </Fragment>
                       ))}
                     </tbody>
@@ -3337,7 +2992,7 @@ export default function HomePage() {
                   <div>
                     <h2 className="font-display text-base font-semibold text-[var(--ink)]">导出到飞书</h2>
                     <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-                      还未连接飞书账号。可先去连接，导出写到「我的」云文档；也可先用应用空间导出。
+                      连接你的飞书账号，即可将报告保存到「我的」云文档。
                     </p>
                   </div>
                   <button
@@ -3357,39 +3012,7 @@ export default function HomePage() {
                   >
                     {feishuOAuthBusy ? "连接中…" : "去连接"}
                   </button>
-                  <button
-                    type="button"
-                    className="btn-ghost w-full !py-2 text-sm"
-                    disabled={busy || !report || selected?.status !== "succeeded"}
-                    onClick={() => void doExportFeishu(true)}
-                  >
-                    先用应用空间导出
-                  </button>
                 </div>
-                {feishuOAuth?.redirect_uri ? (
-                  <p className="mt-3 text-[11px] leading-relaxed text-[var(--faint)]">
-                    开放平台需登记回调：
-                    <button
-                      type="button"
-                      className="btn-text !text-[11px] ml-1"
-                      onClick={async () => {
-                        const u = feishuOAuth.redirect_uri;
-                        try {
-                          await navigator.clipboard.writeText(u);
-                          setFeishuCopyTip("已复制回调地址，去开放平台粘贴登记");
-                          window.setTimeout(() => setFeishuCopyTip(""), 2500);
-                        } catch {
-                          setError(`请手动复制回调地址：${u}`);
-                        }
-                      }}
-                    >
-                      复制回调地址
-                    </button>
-                  </p>
-                ) : null}
-                {feishuCopyTip ? (
-                  <p className="mt-2 text-xs text-[var(--accent)]">{feishuCopyTip}</p>
-                ) : null}
               </div>
             </div>,
             document.body

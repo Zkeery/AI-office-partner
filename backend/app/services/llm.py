@@ -6,11 +6,14 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.core.errors import AppError
 
 
 async def chat_completion(settings: Settings, system: str, user: str) -> str:
-    if settings.llm_mock or not settings.llm_api_key:
+    if settings.llm_mock:
         return _mock_reply(system, user)
+    if not settings.llm_api_key:
+        raise AppError("MODEL_NOT_CONFIGURED", "模型未配置，无法执行任务", status_code=422)
 
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {
@@ -33,6 +36,10 @@ async def chat_completion(settings: Settings, system: str, user: str) -> str:
 
 
 def _mock_reply(system: str, user: str) -> str:
+    if "[EXECUTION_ANALYSIS]" in system:
+        return json.dumps({"summary": "已整理输入与成稿结构（模拟分析，仅用于工程验收）", "findings": ["使用已提供材料", "无来源结论标待核实"]}, ensure_ascii=False)
+    if "[SECTION_REWRITE]" in system:
+        return "已按指令调整本节表述（模拟）。\n\n- 保留事实与来源，未核实的内容仍标待核实。\n"
     # Report / rewrite prompts also mention「计划」, so detect them first.
     if (
         "调研报告撰写" in system

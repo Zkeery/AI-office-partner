@@ -26,6 +26,20 @@ class Settings(BaseSettings):
     llm_mock: bool = True
     llm_price_per_1k_cny: float = 0.02
 
+    # Independent provider profiles. Credentials never leave the server.
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4.1-mini"
+    qwen_api_key: str = ""
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen-plus"
+    doubao_api_key: str = ""
+    doubao_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    doubao_model: str = ""
+
     tavily_api_key: str = ""
     search_mock: bool = True
 

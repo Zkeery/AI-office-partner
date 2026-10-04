@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _make_succeeded_task(client, prompt: str = "OAuth 导出测") -> str:
-    r = client.post("/api/tasks", json={"prompt": prompt, "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": prompt, "urls": []})
     assert r.status_code == 200
     task_id = r.json()["id"]
     client.post(f"/api/tasks/{task_id}/confirm", json={})

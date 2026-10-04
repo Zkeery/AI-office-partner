@@ -1,0 +1,96 @@
+{
+  "task_id": "bc553beb-9bee-4780-80ef-b3d768718fbe",
+  "data_is_synthetic": true,
+  "expected": {
+    "rows": 62,
+    "sheets": 2,
+    "sales_main": 12600,
+    "sales_hidden": 750,
+    "main_mom_pct": 50,
+    "main_yoy_pct": 100
+  },
+  "generation": {
+    "status": "succeeded",
+    "version": 1,
+    "characters": 2557,
+    "sections": [
+      {
+        "id": "section-1",
+        "title": "数据概览"
+      },
+      {
+        "id": "section-2",
+        "title": "关键发现"
+      },
+      {
+        "id": "section-3",
+        "title": "图表解读"
+      },
+      {
+        "id": "section-4",
+        "title": "异常与待核实"
+      },
+      {
+        "id": "section-5",
+        "title": "建议动作"
+      },
+      {
+        "id": "section-6",
+        "title": "参考来源"
+      }
+    ]
+  },
+  "data_checks_passed": true,
+  "analysis_id": "67b08d9c3e27456b868b91ff22ad0c93",
+  "versions": {
+    "section_outside_unchanged": true,
+    "current_version": 3,
+    "restored_exactly": true,
+    "count": 3
+  },
+  "exports": {
+    "xlsx": {
+      "bytes": 22277,
+      "sheets": [
+        "报告",
+        "数据口径",
+        "指标汇总",
+        "分组统计",
+        "月度趋势",
+        "异常明细",
+        "数据-销售明细",
+        "数据-线下补充"
+      ],
+      "native_charts": 4,
+      "formulas": [
+        "=SUM('数据-销售明细'!E2:E61)",
+        "=SUM('数据-销售明细'!F2:F61)",
+        "=AVERAGE('数据-销售明细'!G2:G61)",
+        "=SUM('数据-线下补充'!C2:C3)"
+      ]
+    },
+    "pptx": {
+      "bytes": 76650,
+      "slides": 18,
+      "native_charts": 4
+    },
+    "docx": {
+      "bytes": 38727
+    }
+  },
+  "export_version": 5,
+  "final": {
+    "current_version": 5,
+    "restored_v3_matches_v1": true,
+    "persists_after_restart": true,
+    "row_count": 62,
+    "viewport_mobile": 390,
+    "document_width_mobile": 390,
+    "xlsx_recalculation": [
+      12600,
+      630,
+      0.205,
+      750
+    ]
+  }
+}

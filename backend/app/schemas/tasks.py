@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ class PlanOut(BaseModel):
 
 class TaskCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=8000)
+    model_id: str = Field(min_length=1, max_length=80)
     urls: list[str] = Field(default_factory=list, max_length=3)
     skill_id: str | None = None
     expert_id: str | None = None
@@ -36,6 +37,9 @@ class TaskReplan(BaseModel):
 
 class TaskRewrite(BaseModel):
     instruction: str = Field(min_length=1, max_length=2000)
+    scope: Literal["full", "section"] = "full"
+    section_id: str | None = None
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class TaskMerge(BaseModel):
@@ -63,6 +67,9 @@ class TaskOut(BaseModel):
     status: str
     cost_estimate_cny: float
     cost_confirmed: bool
+    model_id: str | None = None
+    model_name: str | None = None
+    model_label: str | None = None
     skill_id: str | None = None
     expert_id: str | None = None
     plan: PlanOut | None = None

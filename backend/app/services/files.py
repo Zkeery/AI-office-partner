@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +49,13 @@ def _sheet_to_text(rows: list[list[Any]], max_rows: int = 40, max_cols: int = 12
 
 
 def extract_csv_text(data: bytes, max_chars: int = 12000) -> str:
-    text = data.decode("utf-8-sig", errors="ignore")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("gb18030")
     reader = csv.reader(io.StringIO(text))
-    rows = [row for row in reader]
-    return _sheet_to_text(rows)[:max_chars]
+    rows = list(islice(reader, 6))
+    return ("以下仅为材料预览，执行时由程序读取完整表格：\n" + _sheet_to_text(rows))[:max_chars]
 
 
 def extract_xlsx_text(path: Path, max_chars: int = 12000) -> str:
@@ -59,13 +63,11 @@ def extract_xlsx_text(path: Path, max_chars: int = 12000) -> str:
 
     wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        ws = wb.active
-        rows: list[list[object]] = []
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i >= 45:
-                break
-            rows.append(list(row))
-        return _sheet_to_text(rows)[:max_chars]
+        parts = ["以下仅为材料预览，执行时由程序读取全部工作表与数据行："]
+        for ws in wb.worksheets:
+            rows = [list(row) for row in islice(ws.iter_rows(values_only=True), 6)]
+            parts.append(f"工作表：{ws.title}\n" + _sheet_to_text(rows))
+        return "\n\n".join(parts)[:max_chars]
     finally:
         wb.close()
 

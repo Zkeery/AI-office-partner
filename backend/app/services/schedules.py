@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.db.models import Schedule, ScheduleRun, utcnow
 from app.services import tasks as task_service
+from app.services.models import selection_metadata
 
 TRIGGER_INTERVAL = "interval"
 TRIGGER_ON_TASK_SUCCEEDED = "on_task_succeeded"
@@ -24,6 +25,8 @@ def serialize_schedule(row: Schedule) -> dict[str, Any]:
         "id": row.id,
         "name": row.name,
         "prompt": row.prompt,
+        "model_id": row.model_id,
+        "model_name": row.model_name,
         "skill_id": row.skill_id,
         "expert_id": row.expert_id,
         "interval_minutes": row.interval_minutes,
@@ -118,7 +121,9 @@ def create_schedule(
     listen_schedule_id: str | None = None,
     feishu_notify: bool = False,
     feishu_notify_chat_id: str | None = None,
+    model_id: str | None = None,
 ) -> Schedule:
+    chosen = selection_metadata(get_settings(), model_id) if model_id is not None else {}
     mode = _normalize_trigger_mode(trigger_mode)
     if interval_minutes < 1:
         raise AppError("VALIDATION_ERROR", "间隔至少 1 分钟")
@@ -132,6 +137,8 @@ def create_schedule(
         id=str(uuid.uuid4()),
         name=(name or "自动化").strip()[:200],
         prompt=prompt.strip(),
+        model_id=chosen.get("model_id"),
+        model_name=chosen.get("model_name"),
         skill_id=skill_id or None,
         expert_id=expert_id or None,
         interval_minutes=interval_minutes,
@@ -152,6 +159,9 @@ def create_schedule(
 
 def update_schedule(db: Session, schedule_id: str, **fields: Any) -> Schedule:
     row = get_schedule(db, schedule_id)
+    if "model_id" in fields:
+        chosen = selection_metadata(get_settings(), fields["model_id"])
+        row.model_id, row.model_name = chosen["model_id"], chosen["model_name"]
     if "name" in fields and fields["name"] is not None:
         row.name = str(fields["name"]).strip()[:200]
     if "prompt" in fields and fields["prompt"] is not None:
@@ -469,6 +479,8 @@ async def trigger_schedule(
             skill_id=row.skill_id,
             expert_id=row.expert_id,
             source_schedule_id=row.id,
+            model_id=row.model_id,
+            model_name=row.model_name,
         )
         task_id = task.id
         await task_service.confirm_and_run(

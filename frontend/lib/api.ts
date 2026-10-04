@@ -7,10 +7,13 @@ export type Task = {
   status: string;
   cost_estimate_cny: number;
   cost_confirmed: boolean;
+  model_id?: string | null;
+  model_name?: string | null;
+  model_label?: string | null;
   skill_id?: string | null;
   expert_id?: string | null;
   plan?: { title: string; steps: { name: string; goal: string }[] } | null;
-  steps: { seq: number; name: string; status: string }[];
+  steps: { seq: number; name: string; status: string; detail?: { evidence?: string; summary?: string; error_code?: string } }[];
   uploads?: { id: string; filename: string; size_bytes: number; text_excerpt?: string }[];
   has_report: boolean;
   merged_into_id?: string | null;
@@ -38,6 +41,21 @@ export type Expert = {
   best_for?: string;
   output_shape?: string;
 };
+
+export type ModelOption = {
+  id: string;
+  label: string;
+  provider: string;
+  model: string;
+  available: boolean;
+  status: "configured" | "unconfigured" | "mock";
+  hint: string;
+};
+
+export async function listModels(): Promise<ModelOption[]> {
+  const res = await apiFetch(`${API_BASE}/api/models`, { cache: "no-store" });
+  return (await parse<{ items: ModelOption[] }>(res)).items;
+}
 
 function networkHint(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err || "");
@@ -93,7 +111,7 @@ export async function listTasks(opts?: {
 export async function createTask(
   prompt: string,
   urls: string[],
-  opts?: { skill_id?: string; expert_id?: string }
+  opts: { model_id: string; skill_id?: string; expert_id?: string }
 ): Promise<Task> {
   const res = await apiFetch(`${API_BASE}/api/tasks`, {
     method: "POST",
@@ -101,6 +119,7 @@ export async function createTask(
     body: JSON.stringify({
       prompt,
       urls,
+      model_id: opts.model_id,
       skill_id: opts?.skill_id || null,
       expert_id: opts?.expert_id || null,
     }),
@@ -134,11 +153,15 @@ export async function replanTask(
   return parse<Task>(res);
 }
 
-export async function rewriteReport(id: string, instruction: string): Promise<Task> {
+export async function rewriteReport(
+  id: string,
+  instruction: string,
+  options?: { scope: "full" | "section"; section_id?: string; expected_version: number },
+): Promise<Task> {
   const res = await apiFetch(`${API_BASE}/api/tasks/${id}/rewrite`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ instruction }),
+    body: JSON.stringify({ instruction, ...options }),
   });
   return parse<Task>(res);
 }
@@ -176,6 +199,93 @@ export async function getReport(id: string): Promise<string> {
   const res = await apiFetch(`${API_BASE}/api/tasks/${id}/report`, { cache: "no-store" });
   const data = await parse<{ markdown: string }>(res);
   return data.markdown;
+}
+
+export type ReportDocument = {
+  markdown: string;
+  version: number;
+  sections: { id: string; title: string }[];
+};
+
+export type ReportVersion = {
+  version: number;
+  reason: string;
+  instruction: string;
+  created_at: string;
+  characters: number;
+};
+
+export type ReportVersionPreview = ReportVersion & {
+  markdown: string;
+  current_version: number;
+  diff: string;
+  diff_truncated: boolean;
+};
+
+export type DataChart = {
+  kind: "bar" | "line";
+  title: string;
+  labels: string[];
+  values: number[];
+  metric: string;
+  value_format: "number" | "percent";
+};
+
+export type TableSummary = {
+  id: string;
+  source: string;
+  sheet: string;
+  row_count: number;
+  column_count: number;
+  headers: string[];
+  metrics: {
+    column: string; index: number; kind: string; aggregation: "sum" | "mean"; count: number; missing_count: number;
+    invalid_count: number; sum: number; mean: number; min: number; max: number; outlier_count: number;
+  }[];
+  groups: { dimension: string; metric: string; rows: { label: string; value: number; count: number }[] }[];
+  periods: { period: string; metric: string; aggregation: "sum" | "mean"; value: number; mom_pct: number | null; yoy_pct: number | null }[];
+  date_column: string | null;
+  issues: { row: number; column: string; kind: string; value: string; message: string }[];
+  issue_count: number;
+  warnings: string[];
+  charts: DataChart[];
+};
+
+export type AnalysisSummary = {
+  id: string;
+  complete: boolean;
+  created_at: string;
+  source_count: number;
+  sheet_count: number;
+  row_count: number;
+  cell_count: number;
+  sources: { filename: string; sha256: string }[];
+  tables: TableSummary[];
+};
+
+export async function getReportDocument(id: string): Promise<ReportDocument> {
+  return parse<ReportDocument>(await apiFetch(API_BASE + "/api/tasks/" + id + "/report", { cache: "no-store" }));
+}
+
+export async function getTableAnalysis(id: string): Promise<AnalysisSummary | null> {
+  const data = await parse<{ analysis: AnalysisSummary | null }>(await apiFetch(API_BASE + "/api/tasks/" + id + "/analysis", { cache: "no-store" }));
+  return data.analysis;
+}
+
+export async function listReportVersions(id: string): Promise<{ current_version: number; items: ReportVersion[] }> {
+  return parse(await apiFetch(API_BASE + "/api/tasks/" + id + "/report/versions", { cache: "no-store" }));
+}
+
+export async function previewReportVersion(id: string, version: number): Promise<ReportVersionPreview> {
+  return parse(await apiFetch(API_BASE + "/api/tasks/" + id + "/report/versions/" + version, { cache: "no-store" }));
+}
+
+export async function restoreReportVersion(id: string, version: number, expectedVersion: number): Promise<Task> {
+  return parse(await apiFetch(API_BASE + "/api/tasks/" + id + "/report/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version, expected_version: expectedVersion }),
+  }));
 }
 
 export function reportDocxUrl(id: string): string {
@@ -383,6 +493,8 @@ export type Schedule = {
   id: string;
   name: string;
   prompt: string;
+  model_id?: string | null;
+  model_name?: string | null;
   skill_id?: string | null;
   expert_id?: string | null;
   interval_minutes: number;
@@ -430,6 +542,7 @@ export async function listSchedules(): Promise<Schedule[]> {
 export async function createSchedule(body: {
   name: string;
   prompt: string;
+  model_id: string;
   interval_minutes: number;
   skill_id?: string;
   expert_id?: string;
@@ -451,6 +564,7 @@ export async function patchSchedule(
   id: string,
   body: Partial<{
     enabled: boolean;
+    model_id: string;
     name: string;
     prompt: string;
     interval_minutes: number;

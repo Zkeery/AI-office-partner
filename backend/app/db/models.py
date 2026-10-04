@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -41,6 +41,25 @@ class Task(Base):
     uploads: Mapped[list[Upload]] = relationship(
         back_populates="task", cascade="all, delete-orphan"
     )
+    report_versions: Mapped[list[ReportVersion]] = relationship(
+        back_populates="task", cascade="all, delete-orphan"
+    )
+
+
+class ReportVersion(Base):
+    __tablename__ = "report_versions"
+    __table_args__ = (UniqueConstraint("task_id", "version", name="uq_report_task_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    markdown: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(String(40))
+    instruction: Mapped[str] = mapped_column(String(2000), default="")
+    analysis_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    task: Mapped[Task] = relationship(back_populates="report_versions")
 
 
 class TaskStep(Base):
@@ -93,6 +112,8 @@ class Schedule(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), default="")
     prompt: Mapped[str] = mapped_column(Text)
+    model_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     skill_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     expert_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)

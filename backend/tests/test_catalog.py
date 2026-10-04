@@ -8,7 +8,7 @@ def test_catalog_lists(client):
 def test_invalid_skill(client):
     r = client.post(
         "/api/tasks",
-        json={"prompt": "测试", "urls": [], "skill_id": "no_such_skill"},
+        json={"model_id": "mock", "prompt": "测试", "urls": [], "skill_id": "no_such_skill"},
     )
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "SKILL_NOT_FOUND"
@@ -17,7 +17,7 @@ def test_invalid_skill(client):
 def test_create_with_skill(client):
     r = client.post(
         "/api/tasks",
-        json={
+        json={"model_id": "mock",
             "prompt": "调研钉钉与飞书",
             "urls": [],
             "skill_id": "competitor_research",
@@ -34,7 +34,7 @@ def test_create_with_skill(client):
 def test_create_with_expert_default_skill(client):
     r = client.post(
         "/api/tasks",
-        json={"prompt": "明天汇报材料", "urls": [], "expert_id": "briefing_aide"},
+        json={"model_id": "mock", "prompt": "明天汇报材料", "urls": [], "expert_id": "briefing_aide"},
     )
     assert r.status_code == 200
     data = r.json()

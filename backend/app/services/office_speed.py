@@ -68,6 +68,13 @@ def _is_write_step(step: dict[str, Any]) -> bool:
 def accelerate_plan(plan: dict[str, Any], skill_id: str | None) -> dict[str, Any]:
     """Tighten plans: write skills drop search and cap ~3 steps; research caps ~5."""
     out = dict(plan)
+    if skill_id == "table_analysis":
+        out["steps"] = [
+            {"name": "读取完整表格", "goal": "读取全部文件、工作表和数据行", "tool_hint": "read_uploads"},
+            {"name": "计算指标与图表", "goal": "程序计算汇总、分组、月度变化与异常", "tool_hint": "analyze_tables"},
+            {"name": "生成分析成品", "goal": "解释真实计算结果并交付报告", "tool_hint": "write_report"},
+        ]
+        return out
     steps = list(out.get("steps") or [])
     if is_write_skill(skill_id):
         cleaned = [s for s in steps if not _is_search_step(s)]

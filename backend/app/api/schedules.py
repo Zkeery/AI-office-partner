@@ -17,6 +17,7 @@ TriggerMode = Literal["interval", "on_task_succeeded"]
 class ScheduleCreate(BaseModel):
     name: str = "自动化"
     prompt: str = Field(min_length=1, max_length=8000)
+    model_id: str = Field(min_length=1, max_length=80)
     interval_minutes: int = Field(default=60, ge=1, le=10080)
     skill_id: str | None = None
     expert_id: str | None = None
@@ -28,6 +29,7 @@ class ScheduleCreate(BaseModel):
 
 
 class SchedulePatch(BaseModel):
+    model_id: str | None = Field(default=None, min_length=1, max_length=80)
     name: str | None = None
     prompt: str | None = None
     interval_minutes: int | None = Field(default=None, ge=1, le=10080)
@@ -52,6 +54,7 @@ def create_schedule(body: ScheduleCreate, db: Session = Depends(get_db)) -> dict
         db,
         name=body.name,
         prompt=body.prompt,
+        model_id=body.model_id,
         interval_minutes=body.interval_minutes,
         skill_id=body.skill_id,
         expert_id=body.expert_id,

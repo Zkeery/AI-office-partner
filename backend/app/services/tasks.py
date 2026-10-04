@@ -27,8 +27,10 @@ from app.services.files import (
     safe_filename,
 )
 from app.services.llm import chat_completion
+from app.services.models import selection_metadata, task_settings
 from app.services.office_speed import accelerate_plan, is_write_skill
 from app.services.search import fetch_url_text, web_search
+from app.services import reports, table_analysis
 
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
@@ -50,6 +52,8 @@ def _parse_plan(raw: str) -> dict[str, Any]:
     plan = PlanOut.model_validate(data)
     if not (3 <= len(plan.steps) <= 8):
         raise ValueError("steps length")
+    if not any(step.tool_hint == "write_report" for step in plan.steps):
+        raise ValueError("a report-producing step is required")
     return plan.model_dump()
 
 
@@ -112,13 +116,16 @@ def serialize_task(task: Task, *, search_query: str | None = None) -> TaskOut:
         status=task.status,
         cost_estimate_cny=task.cost_estimate_cny,
         cost_confirmed=task.cost_confirmed,
+        model_id=raw.get("model_id"),
+        model_name=raw.get("model_name"),
+        model_label=raw.get("model_label"),
         skill_id=skill_id,
         expert_id=expert_id,
         plan=plan,
         steps=steps,
         uploads=uploads,
         report_path=task.report_path,
-        has_report=bool(task.report_path and Path(task.report_path).exists()),
+        has_report=bool(task.report_path and (Path(task.report_path).exists() or task.report_versions)),
         merged_into_id=merged_into_id,
         merged_from_ids=merged_from_ids,
         search_snippet=snippet,
@@ -363,6 +370,7 @@ def merge_tasks(
 
     primary = _pick_merge_primary(tasks)
     others = [t for t in tasks if t.id != primary.id]
+    primary_revision = reports.current(db, primary) if _task_has_report(primary) else None
 
     sections: list[str] = []
     if _task_has_report(primary):
@@ -380,8 +388,13 @@ def merge_tasks(
         art_dir = settings.artifacts_path / primary.id
         art_dir.mkdir(parents=True, exist_ok=True)
         report_path = art_dir / "report.md"
-        atomic_write_text(report_path, "\n\n---\n\n".join(sections) + "\n")
         primary.report_path = str(report_path)
+        reports.save(
+            db, primary, "\n\n---\n\n".join(sections) + "\n", reason="merge",
+            instruction=f"合并 {len(others)} 个任务",
+            analysis_id=primary_revision.analysis_id if primary_revision else None,
+            expected_version=primary_revision.version if primary_revision else 0,
+        )
         _invalidate_export_caches(primary.id, settings)
 
     note_lines = [f"- {t.title or '未命名'}（{t.id}）" for t in others]
@@ -453,6 +466,8 @@ async def create_task(
     skill_id: str | None = None,
     expert_id: str | None = None,
     source_schedule_id: str | None = None,
+    model_id: str | None = None,
+    model_name: str | None = None,
 ) -> Task:
     from app.services.catalog import resolve_skill_and_expert
 
@@ -465,6 +480,8 @@ async def create_task(
     }
     if source_schedule_id:
         meta["source_schedule_id"] = source_schedule_id
+    if model_id is not None:
+        meta.update(selection_metadata(settings, model_id, model_name))
     task = Task(
         id=str(uuid.uuid4()),
         title="",
@@ -489,6 +506,7 @@ async def generate_plan(
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
+    settings = task_settings(settings, _plan_meta(task))
     task.status = "planning"
     task.error_code = None
     task.error_message = None
@@ -544,6 +562,9 @@ async def generate_plan(
         "skill_id": skill_id,
         "expert_id": expert["id"] if expert else None,
     }
+    for key in ("model_id", "model_name", "model_label"):
+        if key in existing:
+            plan_payload[key] = existing[key]
     # 保留自动化来源，供 1.22 A→B 事件触发关联
     if existing.get("source_schedule_id"):
         plan_payload["source_schedule_id"] = existing["source_schedule_id"]
@@ -637,12 +658,14 @@ async def confirm_and_run(
 async def run_agent_job(db: Session, task_id: str, settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     try:
+        settings = task_settings(settings, _plan_meta(get_task(db, task_id)))
         await _execute_agent(db, task_id, settings)
     except AppError as exc:
         if exc.code == "TASK_NOT_FOUND":
             return
         task = get_task(db, task_id)
         if task.status != "paused":
+            _mark_step_failed(task, exc.code, exc.message)
             task.status = "failed"
             task.error_code = exc.code
             task.error_message = exc.message
@@ -656,6 +679,7 @@ async def run_agent_job(db: Session, task_id: str, settings: Settings | None = N
         except AppError:
             return
         if task.status != "paused":
+            _mark_step_failed(task, "RUN_FAILED", "本步骤执行失败，请重试")
             task.status = "failed"
             task.error_code = "RUN_FAILED"
             task.error_message = "执行失败，请改计划或重试"
@@ -663,6 +687,39 @@ async def run_agent_job(db: Session, task_id: str, settings: Settings | None = N
                 db, task, "error", {"code": task.error_code, "message": task.error_message}
             )
             db.commit()
+
+
+def _mark_step_failed(task: Task, code: str, message: str) -> None:
+    for step in task.steps:
+        if step.status == "running":
+            detail = json.loads(step.detail_json or "{}")
+            detail.update(error_code=code, evidence=message)
+            step.detail_json = json.dumps(detail, ensure_ascii=False)
+            step.status = "failed"
+
+
+async def _ensure_table_analysis(db: Session, task: Task, settings: Settings) -> dict[str, Any] | None:
+    meta = _plan_meta(task)
+    uploads = [
+        {"filename": upload.filename, "stored_path": upload.stored_path}
+        for upload in task.uploads if Path(upload.filename).suffix.lower() in {".csv", ".xlsx"}
+    ]
+    if not uploads:
+        if meta.get("skill_id") == "table_analysis":
+            raise AppError("TABLE_REQUIRED", "请先上传 CSV / Excel，或从资料库选择表格，再开始分析")
+        return None
+    analysis_id = meta.get("analysis_id")
+    if not analysis_id:
+        append_event(db, task, "progress", {"message": "正在完整读取各工作表并计算指标"})
+        db.commit()
+        analysis_id = await asyncio.to_thread(
+            table_analysis.build_snapshot, uploads, settings.artifacts_path / task.id, task.user_prompt
+        )
+        meta["analysis_id"] = analysis_id
+        _save_plan_meta(task, meta)
+        append_event(db, task, "artifact", {"kind": "table_analysis", "analysis_id": analysis_id})
+        db.commit()
+    return table_analysis.load_snapshot(settings.artifacts_path / task.id, analysis_id)["summary"]
 
 
 async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
@@ -674,22 +731,25 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
     skill_id = plan.get("skill_id")
     write_fast = is_write_skill(skill_id)
     search_bits: list[str] = []
-    # 默认不灌资料库全文：只跟用户主动添加的参考（上传 / workspace-refs）走。
-    # 步骤明确要求读本地文件时，仍可在下方 local/本地 分支按需 collect。
+    # Table previews are never used as a substitute for full-data calculations.
     ref_texts = [
         (u.text_excerpt or "").strip()
         for u in task.uploads
-        if (u.text_excerpt or "").strip()
+        if (u.text_excerpt or "").strip() and Path(u.filename).suffix.lower() not in {".csv", ".xlsx"}
     ]
     if ref_texts:
-        joined = "\n---\n".join(ref_texts)[:4000]
+        joined = "\n---\n".join(ref_texts)[:12000]
         search_bits.append("用户添加的参考材料：\n" + joined)
         append_event(db, task, "progress", {"message": "已读取用户添加的参考材料"})
         db.commit()
     steps = list(task.steps)
-    max_steps = min(len(steps), settings.agent_max_steps)
+    if not steps or len(steps) > settings.agent_max_steps:
+        raise AppError("STEP_LIMIT_EXCEEDED", "计划步骤超出执行范围，请重新生成较短计划")
+    max_steps = len(steps)
+    if not any(json.loads(step.detail_json or "{}").get("tool_hint") == "write_report" for step in steps):
+        raise AppError("REPORT_STEP_REQUIRED", "计划缺少成品生成步骤，请重新生成计划")
 
-    for idx, step in enumerate(steps[:max_steps], start=1):
+    for idx, step in enumerate(steps, start=1):
         db.refresh(task)
         task = get_task(db, task_id)
         if task.status == "paused":
@@ -697,76 +757,121 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
             db.commit()
             return
 
-        if step.status == "done":
+        if step.status in {"done", "skipped"}:
             try:
                 detail = json.loads(step.detail_json or "{}")
             except Exception:
                 detail = {}
-            if detail.get("results"):
+            if detail.get("context"):
+                search_bits.append(detail["context"])
+            elif detail.get("results"):
                 search_bits.append(json.dumps(detail["results"], ensure_ascii=False))
             continue
 
+        detail = json.loads(step.detail_json or "{}")
+        detail.pop("error_code", None)
         step.status = "running"
         append_event(
             db, task, "step", {"seq": step.seq, "name": step.name, "status": "running"}
         )
         db.commit()
 
-        detail = {}
-        try:
-            detail = json.loads(step.detail_json or "{}")
-        except Exception:
-            detail = {}
-        hint = (detail.get("tool_hint") or "").lower()
-
-        if "search" in hint or "检索" in step.name:
+        hint = (detail.get("tool_hint") or "").strip().lower()
+        hint = {"none": "analyze", "": "analyze", "read_local": "read_workspace"}.get(hint, hint)
+        outcome = "done"
+        context = ""
+        if hint == "web_search":
             if write_fast:
-                detail["note"] = "写类办公加速：跳过联网检索"
-                append_event(
-                    db,
-                    task,
-                    "progress",
-                    {"message": f"跳过检索（写类加速）：{step.name}"},
-                )
+                outcome = "skipped"
+                detail["evidence"] = "此写作任务使用用户材料，未执行联网检索"
             else:
-                results = await web_search(settings, task.user_prompt[:200])
-                search_bits.append(json.dumps(results, ensure_ascii=False))
+                query = (detail.get("goal") or task.user_prompt)[:300]
+                results = await web_search(settings, query)
+                context = json.dumps(results, ensure_ascii=False)
                 detail["results"] = results
-        elif "fetch" in hint and urls:
-            text = await fetch_url_text(urls[0])
-            search_bits.append(text[:2000])
-            detail["fetched_chars"] = len(text)
-        elif "upload" in hint or "材料" in step.name or "local" in hint or "本地" in step.name:
-            texts = [u.text_excerpt or "" for u in task.uploads]
-            search_bits.append("\n".join(texts)[:4000])
-            detail["upload_count"] = len(texts)
-            if "local" in hint or "本地" in step.name:
+                detail["evidence"] = f"已检索并取得 {len(results)} 条结果" if results else "已执行检索，未找到公开来源；报告须标待核实"
+                if not results:
+                    context = "检索未找到公开来源，请明确标注待核实。"
+        elif hint == "fetch_url":
+            if not urls:
+                outcome = "skipped"
+                detail["evidence"] = "没有提供参考链接，未执行网页读取"
+            else:
+                parts = []
+                for url in urls:
+                    text = await fetch_url_text(url)
+                    if not text.strip():
+                        raise AppError("EMPTY_SOURCE", "参考网页没有可读取正文，请更换链接")
+                    parts.append(f"来源：{url}\n{text}")
+                context = "\n---\n".join(parts)
+                detail["evidence"] = f"已读取 {len(parts)} 个链接，共 {sum(len(p) for p in parts)} 字符"
+        elif hint in {"read_uploads", "read_workspace", "analyze_tables"}:
+            analysis = await _ensure_table_analysis(db, task, settings)
+            if hint == "analyze_tables" and analysis is None:
+                raise AppError("TABLE_REQUIRED", "请添加 CSV 或 XLSX 数据后再执行表格计算")
+            texts = [u.text_excerpt or "" for u in task.uploads if Path(u.filename).suffix.lower() not in {".csv", ".xlsx"}]
+            context = "\n".join(texts)[:12000]
+            detail["evidence"] = f"已读取 {len(task.uploads)} 份参考材料"
+            if analysis:
+                detail["analysis_id"] = analysis["id"]
+                detail["evidence"] = f"已完整计算 {analysis['source_count']} 个文件、{analysis['sheet_count']} 个工作表、{analysis['row_count']} 行数据"
+            if hint == "read_workspace":
                 extra = collect_workspace_excerpts(settings)
                 if extra:
-                    search_bits.append(extra)
+                    context += "\n" + extra
                     detail["workspace_chars"] = len(extra)
-        elif "write" in hint or "报告" in step.name or "成稿" in step.name or idx == max_steps:
+                    detail["evidence"] = f"已读取授权目录摘录 {len(extra)} 字符；该步骤不是全目录数据分析"
+            if not context.strip() and analysis is None:
+                outcome = "skipped"
+                detail["evidence"] = "没有可读取的参考材料，本次仅依据用户描述起草"
+        elif hint == "analyze":
+            analysis = await _ensure_table_analysis(db, task, settings)
+            material = table_analysis.prompt_summary(analysis) if analysis else "\n---\n".join(search_bits)[-24000:]
+            raw = await chat_completion(
+                settings,
+                "[EXECUTION_ANALYSIS] 根据已提供的需求和材料完成当前分析/结构组织步骤。输出严格 JSON："
+                '{"summary":"非空的分析结论","findings":["要点"]}。不能声称使用了其他工具；缺少来源就写待核实。',
+                f"需求：{task.user_prompt}\n步骤：{step.name}\n目标：{detail.get('goal', '')}\n材料：{material}",
+            )
+            try:
+                clean = raw.strip().removeprefix(chr(96) * 3 + "json").removeprefix(chr(96) * 3).removesuffix(chr(96) * 3).strip()
+                parsed = json.loads(clean)
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
+                    raise ValueError("missing summary")
+                if not isinstance(parsed.get("findings"), list) or not all(isinstance(item, str) for item in parsed["findings"]):
+                    raise ValueError("invalid findings")
+                context = (parsed["summary"] + "\n" + "\n".join(parsed["findings"]))[:12000]
+            except (ValueError, TypeError, KeyError) as exc:
+                raise AppError("ANALYSIS_INVALID", "本步骤未返回有效分析结果，请重试") from exc
+            detail["evidence"] = "已生成可查看的分析结论与要点"
+            detail["summary"] = parsed["summary"][:500]
+        elif hint == "write_report":
+            analysis = await _ensure_table_analysis(db, task, settings)
             report = await _write_report(settings, task, search_bits)
+            reports.validate_markdown(report)
             art_dir = settings.artifacts_path / task.id
             report_path = art_dir / "report.md"
-            atomic_write_text(report_path, report)
             task.report_path = str(report_path)
+            revision = reports.save(db, task, report, reason="generated", analysis_id=analysis["id"] if analysis else None)
             detail["report_path"] = str(report_path)
+            detail["evidence"] = f"已保存报告 v{revision.version}，正文 {len(report)} 字符"
             append_event(
                 db, task, "artifact", {"kind": "report", "path": str(report_path)}
             )
         else:
-            # generic step: small wait marker
-            detail["note"] = "completed"
+            raise AppError("TOOL_UNSUPPORTED", f"步骤「{step.name}」要求的操作暂不支持，请改计划后重试")
 
+        if context:
+            search_bits.append(context)
+            detail["context"] = context
         step.detail_json = json.dumps(detail, ensure_ascii=False)
-        step.status = "done"
-        append_event(db, task, "step", {"seq": step.seq, "name": step.name, "status": "done"})
+        step.status = outcome
+        append_event(db, task, "step", {"seq": step.seq, "name": step.name, "status": outcome, "evidence": detail["evidence"]})
         append_event(
             db,
             task,
             "progress",
-            {"message": f"完成：{step.name}", "percent": int(idx / max_steps * 100)},
+            {"message": f"{'已完成' if outcome == 'done' else '已跳过'}：{step.name} · {detail['evidence']}", "percent": int(idx / max_steps * 100)},
         )
         db.commit()
         await asyncio.sleep(0.05)
@@ -775,12 +880,11 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
     if task.status == "paused":
         return
 
-    if not task.report_path:
-        report = await _write_report(settings, task, search_bits)
-        report_path = settings.artifacts_path / task.id / "report.md"
-        atomic_write_text(report_path, report)
-        task.report_path = str(report_path)
-        append_event(db, task, "artifact", {"kind": "report", "path": str(report_path)})
+    if not task.report_path or not Path(task.report_path).is_file():
+        raise AppError("REPORT_NOT_READY", "步骤结束但没有生成报告，请重试")
+    reports.validate_markdown(reports.current(db, task).markdown)
+    if any(step.status not in {"done", "skipped"} for step in task.steps):
+        raise AppError("STEPS_INCOMPLETE", "仍有步骤未完成，任务不能标记成功")
 
     task.status = "succeeded"
     append_event(db, task, "done", {"task_id": task.id, "status": "succeeded"})
@@ -803,8 +907,12 @@ async def _write_report(settings: Settings, task: Task, search_bits: list[str]) 
     user = (
         f"用户需求：\n{task.user_prompt}\n\n"
         f"计划：\n{task.plan_json}\n\n"
-        f"已收集摘录：\n" + "\n---\n".join(search_bits[:6])
+        f"已收集摘录：\n" + "\n---\n".join(search_bits)[-40000:]
     )
+    if meta.get("analysis_id"):
+        analysis = table_analysis.load_snapshot(settings.artifacts_path / task.id, meta["analysis_id"])["summary"]
+        system += "\n表格结论必须依据程序已计算的结果；不要把材料预览当全部数据，不自行猜测未计算的数字。指出缺失值、非数字与基期缺失；不要编造已经生成的图表路径。"
+        user += "\n\n" + table_analysis.prompt_summary(analysis)
     return await chat_completion(settings, system, user)
 
 
@@ -813,41 +921,104 @@ async def rewrite_report(
     task_id: str,
     instruction: str,
     settings: Settings | None = None,
+    *,
+    scope: str = "full",
+    section_id: str | None = None,
+    expected_version: int | None = None,
 ) -> Task:
     """Rewrite an existing succeeded report using a user instruction."""
     settings = settings or get_settings()
     task = get_task(db, task_id)
+    settings = task_settings(settings, _plan_meta(task))
     if task.status != "succeeded":
         raise AppError("INVALID_STATE", "仅已成功完成的任务可重写报告")
-    if not task.report_path or not Path(task.report_path).exists():
-        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
     text = (instruction or "").strip()
     if not text:
         raise AppError("VALIDATION_ERROR", "请填写改写指令")
 
-    old = Path(task.report_path).read_text(encoding="utf-8")
+    revision = reports.current(db, task)
+    base_version = revision.version
+    if expected_version is not None and expected_version != base_version:
+        raise AppError("REPORT_CONFLICT", "报告已更新，请刷新后再修改", status_code=409)
+    old = revision.markdown
+    selected_text = old
+    selected_part = None
+    if scope == "section":
+        selected_part = next((part for part in reports.sections(old) if part["id"] == section_id), None)
+        if selected_part is None:
+            raise AppError("SECTION_NOT_FOUND", "请选择要修改的章节", status_code=422)
+        selected_text = old[selected_part["body_start"]:selected_part["end"]]
+    elif scope != "full":
+        raise AppError("VALIDATION_ERROR", "改写范围无效", status_code=422)
+    if len(selected_text) > 60000:
+        raise AppError("REWRITE_TOO_LARGE", "本次正文过长，请选择一个较短章节修改")
     system = _load_prompt("report.md")
-    system += (
-        "\n\n你正在按用户指令改写已有 Markdown 报告。"
-        "保持结构清晰，仍遵守来源与待核实约束；输出完整报告正文。"
-    )
+    if selected_part:
+        system += (
+            "\n[SECTION_REWRITE] 只按指令改写选中章节的正文。只返回这一节的新正文，"
+            "不要返回章节标题、文档标题或其他章节，不要用代码围栏包装。保留来源与事实口径。"
+        )
+    else:
+        system += "\n你正在按用户指令改写已有 Markdown 报告。输出完整正文，保留事实与来源。"
     user = (
         f"用户原始需求：\n{task.user_prompt}\n\n"
         f"【改写指令】\n{text}\n\n"
-        f"【当前报告】\n{old[:12000]}\n"
+        f"【当前报告】\n{selected_text}\n"
     )
-    new_md = await chat_completion(settings, system, user)
-    report_path = Path(task.report_path)
-    atomic_write_text(report_path, new_md)
-    # invalidate export caches
-    art = settings.artifacts_path / task.id
-    for name in ("report.docx", "report.xlsx", "report.pptx"):
-        p = art / name
-        if p.exists():
-            p.unlink()
-    append_event(db, task, "artifact", {"kind": "report_rewrite", "instruction": text[:200]})
+    if selected_part:
+        user += f"\n选中章节：{selected_part['title']}\n"
+    analysis_id = revision.analysis_id
+    if analysis_id:
+        analysis = table_analysis.load_snapshot(settings.artifacts_path / task.id, analysis_id)["summary"]
+        user += "\n" + table_analysis.prompt_summary(analysis)
+    changed = await chat_completion(settings, system, user)
+    new_md = reports.replace_section(old, section_id, changed) if selected_part else reports.validate_markdown(changed)
+    # End the read transaction after the model call, then compare against the current head.
+    db.rollback()
+    task = get_task(db, task_id)
+    if task.status != "succeeded":
+        raise AppError("INVALID_STATE", "任务状态已改变，未保存改写")
+    saved = reports.save(
+        db, task, new_md, reason="section_rewrite" if selected_part else "rewrite",
+        instruction=(f"【{selected_part['title']}】" if selected_part else "") + text,
+        analysis_id=analysis_id, expected_version=base_version,
+    )
+    _invalidate_export_caches(task_id, settings)
+    append_event(db, task, "artifact", {"kind": "report_rewrite", "version": saved.version, "instruction": text[:200]})
     db.commit()
     return get_task(db, task_id)
+
+
+def restore_report(
+    db: Session, task_id: str, version: int, expected_version: int,
+    settings: Settings | None = None,
+) -> Task:
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.status != "succeeded":
+        raise AppError("INVALID_STATE", "仅已完成的任务可恢复报告版本")
+    reports.current(db, task)
+    target = reports.get_version(db, task, version)
+    saved = reports.save(
+        db, task, target.markdown, reason="restore", instruction=f"恢复 v{version}",
+        analysis_id=target.analysis_id, expected_version=expected_version,
+    )
+    _invalidate_export_caches(task_id, settings)
+    append_event(db, task, "artifact", {"kind": "report_restore", "version": saved.version, "restored_from": version})
+    db.commit()
+    return get_task(db, task_id)
+
+
+def get_analysis(db: Session, task_id: str, settings: Settings | None = None) -> dict[str, Any] | None:
+    settings = settings or get_settings()
+    task = get_task(db, task_id)
+    if task.report_path:
+        analysis_id = reports.current(db, task).analysis_id
+    else:
+        analysis_id = _plan_meta(task).get("analysis_id")
+    if not analysis_id:
+        return None
+    return table_analysis.load_snapshot(settings.artifacts_path / task.id, analysis_id)["summary"]
 
 
 def pause_task(db: Session, task_id: str) -> Task:
@@ -886,17 +1057,23 @@ async def add_upload(db: Session, task_id: str, upload_file, settings: Settings 
     task = get_task(db, task_id)
     if len(task.uploads) >= MAX_FILES:
         raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
-    if task.status in {"running"}:
-        raise AppError("INVALID_STATE", "运行中不可上传")
+    if task.status not in {"plan_ready", "paused", "failed"}:
+        raise AppError("INVALID_STATE", "请在任务开始前添加材料")
+    if any(step.status in {"done", "skipped"} for step in task.steps):
+        raise AppError("MATERIAL_CHANGE_REQUIRES_REPLAN", "部分步骤已执行，请先改计划，再添加新材料")
 
     filename = safe_filename(upload_file.filename or "upload.bin")
     ext = assert_allowed(filename)
     data = await read_upload_bytes(upload_file)
     dest_dir = settings.uploads_path / task.id
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
+    dest = dest_dir / f"{uuid.uuid4().hex}_{filename}"
     dest.write_bytes(data)
-    excerpt = extract_text(dest, ext)
+    try:
+        excerpt = extract_text(dest, ext)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise AppError("UPLOAD_INVALID", "文件内容无法读取，请检查格式或是否已加密")
     row = Upload(
         task_id=task.id,
         filename=filename,
@@ -923,8 +1100,10 @@ def add_workspace_refs(
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
-    if task.status in {"running", "succeeded"}:
+    if task.status not in {"plan_ready", "paused", "failed"}:
         raise AppError("INVALID_STATE", "当前状态不可再添加参考材料")
+    if any(step.status in {"done", "skipped"} for step in task.steps):
+        raise AppError("MATERIAL_CHANGE_REQUIRES_REPLAN", "部分步骤已执行，请先改计划，再添加新材料")
     if not paths:
         raise AppError("VALIDATION_ERROR", "请选择至少一个资料库文件")
 
@@ -944,14 +1123,12 @@ def add_workspace_refs(
         size = src.stat().st_size
         if size > MAX_BYTES:
             raise AppError("UPLOAD_TOO_LARGE", f"{filename} 超过 20MB")
-        dest = dest_dir / filename
-        if dest.exists():
-            dest = dest_dir / f"ws_{filename}"
+        dest = dest_dir / f"{uuid.uuid4().hex}_{filename}"
         dest.write_bytes(src.read_bytes())
         excerpt = extract_text(dest, ext)
         row = Upload(
             task_id=task.id,
-            filename=dest.name,
+            filename=filename,
             stored_path=str(dest),
             mime="application/octet-stream",
             size_bytes=size,
@@ -959,7 +1136,7 @@ def add_workspace_refs(
         )
         db.add(row)
         used += 1
-        append_event(db, task, "progress", {"message": f"已从资料库添加 {dest.name}"})
+        append_event(db, task, "progress", {"message": f"已从资料库添加 {filename}"})
 
     db.commit()
     return get_task(db, task_id)
@@ -967,9 +1144,7 @@ def add_workspace_refs(
 
 def read_report(db: Session, task_id: str) -> str:
     task = get_task(db, task_id)
-    if not task.report_path or not Path(task.report_path).exists():
-        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
-    return Path(task.report_path).read_text(encoding="utf-8")
+    return reports.current(db, task).markdown
 
 
 def report_download_stem(task: Task) -> str:
@@ -982,42 +1157,43 @@ def report_download_stem(task: Task) -> str:
     return cleaned[:80]
 
 def ensure_docx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
-    from app.services.docx_export import ensure_docx_from_markdown
+    from app.services.docx_export import markdown_to_docx
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
-    if not task.report_path or not Path(task.report_path).exists():
-        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
-    docx_path = settings.artifacts_path / task.id / "report.docx"
+    revision = reports.current(db, task)
+    docx_path = settings.artifacts_path / task.id / f"report-v{revision.version}.docx"
     if docx_path.exists() and docx_path.stat().st_size > 0:
         return docx_path
-    return ensure_docx_from_markdown(Path(task.report_path), docx_path)
+    return markdown_to_docx(revision.markdown, docx_path)
 
 
 def ensure_xlsx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
-    from app.services.xlsx_export import ensure_xlsx_from_markdown
+    from app.services.xlsx_export import markdown_to_xlsx, analysis_to_xlsx
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
-    if not task.report_path or not Path(task.report_path).exists():
-        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
-    xlsx_path = settings.artifacts_path / task.id / "report.xlsx"
+    revision = reports.current(db, task)
+    xlsx_path = settings.artifacts_path / task.id / f"report-v{revision.version}.xlsx"
     if xlsx_path.exists() and xlsx_path.stat().st_size > 0:
         return xlsx_path
-    return ensure_xlsx_from_markdown(Path(task.report_path), xlsx_path)
+    if revision.analysis_id:
+        snapshot = table_analysis.load_snapshot(settings.artifacts_path / task.id, revision.analysis_id)
+        return analysis_to_xlsx(snapshot, revision.markdown, xlsx_path)
+    return markdown_to_xlsx(revision.markdown, xlsx_path)
 
 
 def ensure_pptx(db: Session, task_id: str, settings: Settings | None = None) -> Path:
-    from app.services.pptx_export import ensure_pptx_from_markdown
+    from app.services.pptx_export import markdown_to_pptx
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
-    if not task.report_path or not Path(task.report_path).exists():
-        raise AppError("REPORT_NOT_READY", "报告尚未生成", status_code=404)
-    pptx_path = settings.artifacts_path / task.id / "report.pptx"
+    revision = reports.current(db, task)
+    pptx_path = settings.artifacts_path / task.id / f"report-v{revision.version}.pptx"
     if pptx_path.exists() and pptx_path.stat().st_size > 0:
         return pptx_path
-    return ensure_pptx_from_markdown(Path(task.report_path), pptx_path)
+    analysis = table_analysis.load_snapshot(settings.artifacts_path / task.id, revision.analysis_id)["summary"] if revision.analysis_id else None
+    return markdown_to_pptx(revision.markdown, pptx_path, analysis=analysis)
 
 
 async def export_report_to_feishu(

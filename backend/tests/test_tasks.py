@@ -21,7 +21,7 @@ def test_health(client):
 
 
 def test_create_plan_ready(client):
-    r = client.post("/api/tasks", json={"prompt": "调研 AI 办公助手", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "调研 AI 办公助手", "urls": []})
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "plan_ready"
@@ -29,7 +29,7 @@ def test_create_plan_ready(client):
 
 
 def test_cannot_succeed_without_confirm(client):
-    r = client.post("/api/tasks", json={"prompt": "调研", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "调研", "urls": []})
     task_id = r.json()["id"]
     detail = client.get(f"/api/tasks/{task_id}").json()
     assert detail["status"] == "plan_ready"
@@ -37,7 +37,7 @@ def test_cannot_succeed_without_confirm(client):
 
 
 def test_confirm_run_report(client):
-    r = client.post("/api/tasks", json={"prompt": "调研办公 AI", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "调研办公 AI", "urls": []})
     task_id = r.json()["id"]
     r2 = client.post(f"/api/tasks/{task_id}/confirm", json={"confirm_cost": False})
     assert r2.status_code == 200
@@ -49,7 +49,7 @@ def test_confirm_run_report(client):
 
 
 def test_cost_confirm_required(client):
-    r = client.post("/api/tasks", json={"prompt": "HIGH_COST 调研", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "HIGH_COST 调研", "urls": []})
     task_id = r.json()["id"]
     detail = client.get(f"/api/tasks/{task_id}").json()
     assert detail["cost_estimate_cny"] > 5
@@ -61,7 +61,7 @@ def test_cost_confirm_required(client):
 
 
 def test_upload_reject_and_accept(client):
-    r = client.post("/api/tasks", json={"prompt": "带材料调研", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "带材料调研", "urls": []})
     task_id = r.json()["id"]
     bad = client.post(
         f"/api/tasks/{task_id}/uploads",
@@ -77,7 +77,7 @@ def test_upload_reject_and_accept(client):
 
 
 def test_pause_resume_and_delete(client):
-    r = client.post("/api/tasks", json={"prompt": "暂停测试", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "暂停测试", "urls": []})
     task_id = r.json()["id"]
     client.post(f"/api/tasks/{task_id}/confirm", json={})
     detail = client.get(f"/api/tasks/{task_id}").json()
@@ -93,7 +93,7 @@ def test_pause_resume_and_delete(client):
 
 
 def test_sse_ends_with_done(client):
-    r = client.post("/api/tasks", json={"prompt": "SSE", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "SSE", "urls": []})
     task_id = r.json()["id"]
     client.post(f"/api/tasks/{task_id}/confirm", json={})
     detail = _wait_status(client, task_id, {"succeeded", "failed"}, timeout=8.0)
@@ -113,7 +113,7 @@ def test_recover_running_to_paused(client):
     from app.db import session as db_session
     from app.services import tasks as task_service
 
-    r = client.post("/api/tasks", json={"prompt": "恢复", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "恢复", "urls": []})
     task_id = r.json()["id"]
     db = db_session.SessionLocal()
     try:
@@ -129,7 +129,7 @@ def test_recover_running_to_paused(client):
 
 
 def test_docx_export(client):
-    r = client.post("/api/tasks", json={"prompt": "导出Word", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "导出Word", "urls": []})
     task_id = r.json()["id"]
     assert client.get(f"/api/tasks/{task_id}/report.docx").status_code == 404
     client.post(f"/api/tasks/{task_id}/confirm", json={})
@@ -156,7 +156,7 @@ def test_report_download_stem_sanitizes():
 
 
 def test_xlsx_export(client):
-    r = client.post("/api/tasks", json={"prompt": "导出表格", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "导出表格", "urls": []})
     task_id = r.json()["id"]
     assert client.get(f"/api/tasks/{task_id}/report.xlsx").status_code == 404
     client.post(f"/api/tasks/{task_id}/confirm", json={})
@@ -173,7 +173,7 @@ def test_xlsx_export(client):
 
 
 def test_pptx_export(client):
-    r = client.post("/api/tasks", json={"prompt": "导出PPT", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "导出PPT", "urls": []})
     task_id = r.json()["id"]
     assert client.get(f"/api/tasks/{task_id}/report.pptx").status_code == 404
     client.post(f"/api/tasks/{task_id}/confirm", json={})
@@ -189,7 +189,7 @@ def test_pptx_export(client):
 
 
 def test_replan_and_retry_failed(client):
-    r = client.post("/api/tasks", json={"prompt": "初版需求", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "初版需求", "urls": []})
     task_id = r.json()["id"]
     assert r.json()["status"] == "plan_ready"
 
@@ -232,7 +232,7 @@ def test_replan_and_retry_failed(client):
 
 
 def test_rewrite_report(client):
-    r = client.post("/api/tasks", json={"prompt": "需要重写的报告", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "需要重写的报告", "urls": []})
     task_id = r.json()["id"]
     client.post(f"/api/tasks/{task_id}/confirm", json={})
     _wait_status(client, task_id, {"succeeded", "failed"})
@@ -256,7 +256,7 @@ def test_rewrite_report(client):
 
 
 def test_export_feishu_mock(client):
-    r = client.post("/api/tasks", json={"prompt": "导出飞书报告", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "导出飞书报告", "urls": []})
     task_id = r.json()["id"]
 
     not_ready = client.post(
@@ -306,8 +306,8 @@ def test_feishu_markdown_plain_text():
 
 
 def test_merge_tasks(client):
-    a = client.post("/api/tasks", json={"prompt": "合并源 A 调研", "urls": []}).json()["id"]
-    b = client.post("/api/tasks", json={"prompt": "合并源 B 调研", "urls": []}).json()["id"]
+    a = client.post("/api/tasks", json={"model_id": "mock", "prompt": "合并源 A 调研", "urls": []}).json()["id"]
+    b = client.post("/api/tasks", json={"model_id": "mock", "prompt": "合并源 B 调研", "urls": []}).json()["id"]
     client.post(f"/api/tasks/{a}/confirm", json={})
     client.post(f"/api/tasks/{b}/confirm", json={})
     _wait_status(client, a, {"succeeded", "failed"})

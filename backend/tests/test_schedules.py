@@ -6,7 +6,7 @@ from app.core.errors import AppError
 def test_schedule_create_run_disable(client):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "每小时速览",
             "prompt": "定时行业速览测试",
             "interval_minutes": 60,
@@ -50,7 +50,7 @@ def test_schedule_create_run_disable(client):
 def test_schedule_apperror_sets_last_error_and_last_run_at(client, monkeypatch):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "失败自动化",
             "prompt": "触发 AppError",
             "interval_minutes": 30,
@@ -78,7 +78,7 @@ def test_schedule_apperror_sets_last_error_and_last_run_at(client, monkeypatch):
 def test_schedule_task_failed_keeps_last_task_and_error(client, monkeypatch):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "执行失败自动化",
             "prompt": "任务跑挂后仍可跟",
             "interval_minutes": 60,
@@ -116,7 +116,7 @@ def test_schedule_task_failed_keeps_last_task_and_error(client, monkeypatch):
 def test_schedule_run_history_success_and_fail(client, monkeypatch):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "跑次历史",
             "prompt": "连续跑两次看历史",
             "interval_minutes": 60,
@@ -168,7 +168,7 @@ def test_schedule_run_history_success_and_fail(client, monkeypatch):
 def test_schedule_run_history_apperror_and_prune(client, monkeypatch):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "裁剪历史",
             "prompt": "超过 N 条淘汰",
             "interval_minutes": 30,
@@ -229,7 +229,7 @@ def test_unread_notices_filters_acked():
 def test_schedule_result_notices_success_and_fail(client, monkeypatch):
     r = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "结果通知自动化",
             "prompt": "跑出成功和失败各一次",
             "interval_minutes": 60,
@@ -291,7 +291,7 @@ def test_on_task_succeeded_triggers_listener_once(client):
     """刀1：A 立即跑成功 → B 自动出现 trigger=task_done 跑次。"""
     a = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "自动化A",
             "prompt": "上游任务 A",
             "interval_minutes": 60,
@@ -305,7 +305,7 @@ def test_on_task_succeeded_triggers_listener_once(client):
 
     b = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "自动化B",
             "prompt": "下游任务 B，听 A 成功",
             "interval_minutes": 60,
@@ -347,7 +347,7 @@ def test_on_task_succeeded_no_self_and_depth_one(client):
     """防环：不能监听自己；A→B 后 B 成功不再链式触发 C（depth≤1）。"""
     a = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "链A",
             "prompt": "A",
             "interval_minutes": 60,
@@ -360,7 +360,7 @@ def test_on_task_succeeded_no_self_and_depth_one(client):
 
     b = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "链B",
             "prompt": "B",
             "interval_minutes": 60,
@@ -381,7 +381,7 @@ def test_on_task_succeeded_no_self_and_depth_one(client):
 
     c = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "链C",
             "prompt": "C 不应被 B 链式触发",
             "interval_minutes": 60,
@@ -406,7 +406,7 @@ def test_on_task_succeeded_no_self_and_depth_one(client):
 
     missing = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "缺监听",
             "prompt": "x",
             "trigger_mode": "on_task_succeeded",
@@ -417,7 +417,7 @@ def test_on_task_succeeded_no_self_and_depth_one(client):
 
     ghost = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "幽灵",
             "prompt": "x",
             "trigger_mode": "on_task_succeeded",
@@ -439,7 +439,7 @@ def test_event_schedule_not_ticked_as_interval(client):
 
     a = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "间隔旧自动化",
             "prompt": "interval 回归",
             "interval_minutes": 60,
@@ -454,7 +454,7 @@ def test_event_schedule_not_ticked_as_interval(client):
     # 上游占位：B 监听它，但故意不把它标为到期，避免 A→B 链式干扰「非 tick」断言
     upstream = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "未到期上游",
             "prompt": "不会在本测 tick",
             "interval_minutes": 60,
@@ -468,7 +468,7 @@ def test_event_schedule_not_ticked_as_interval(client):
 
     b = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "纯事件",
             "prompt": "不应被 tick",
             "interval_minutes": 60,
@@ -513,7 +513,7 @@ def test_webhook_auth_success_triggers_once(client):
     """刀2：有效密钥 POST hook → 跑次 trigger=webhook；last_* / notices 复用。"""
     created = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "Webhook 目标",
             "prompt": "被 webhook 触发的任务",
             "interval_minutes": 60,
@@ -571,7 +571,7 @@ def test_webhook_auth_failure_and_rotate_invalidates(client):
     """刀2：缺密钥/错密钥/旧密钥 → 401，不创建跑次；轮换后新密钥可用。"""
     created = client.post(
         "/api/schedules",
-        json={
+        json={"model_id": "mock",
             "name": "鉴权拒",
             "prompt": "不应被错误密钥触发",
             "interval_minutes": 60,

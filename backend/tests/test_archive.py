@@ -26,7 +26,7 @@ def test_auto_archive_by_count(client, monkeypatch):
 
     ids = []
     for i in range(5):
-        r = client.post("/api/tasks", json={"prompt": f"归档条数测试 {i}", "urls": []})
+        r = client.post("/api/tasks", json={"model_id": "mock", "prompt": f"归档条数测试 {i}", "urls": []})
         tid = r.json()["id"]
         ids.append(tid)
         client.post(f"/api/tasks/{tid}/confirm", json={})
@@ -53,7 +53,7 @@ def test_auto_archive_by_age(client, monkeypatch):
     monkeypatch.setenv("TASK_ARCHIVE_AFTER_DAYS", "1")
     get_settings.cache_clear()
 
-    r = client.post("/api/tasks", json={"prompt": "归档天数测试", "urls": []})
+    r = client.post("/api/tasks", json={"model_id": "mock", "prompt": "归档天数测试", "urls": []})
     tid = r.json()["id"]
     client.post(f"/api/tasks/{tid}/confirm", json={})
     assert _wait_status(client, tid, {"succeeded", "failed"}) == "succeeded"

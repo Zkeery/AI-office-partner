@@ -25,6 +25,14 @@ from app.schemas.tasks import (
     TaskRewrite,
 )
 from app.services import tasks as task_service
+from app.services import reports
+from app.schemas.reports import (
+    AnalysisResponse,
+    ReportDocument,
+    ReportRestore,
+    ReportVersionList,
+    ReportVersionPreview,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -63,6 +71,7 @@ async def create_task(body: TaskCreate, db: Session = Depends(get_db)) -> TaskOu
         body.urls,
         skill_id=body.skill_id,
         expert_id=body.expert_id,
+        model_id=body.model_id,
     )
     return _to_out(task)
 
@@ -156,7 +165,10 @@ async def replan_task(
 async def rewrite_task(
     task_id: str, body: TaskRewrite, db: Session = Depends(get_db)
 ) -> TaskOut:
-    task = await task_service.rewrite_report(db, task_id, body.instruction)
+    task = await task_service.rewrite_report(
+        db, task_id, body.instruction, scope=body.scope,
+        section_id=body.section_id, expected_version=body.expected_version,
+    )
     return _to_out(task)
 
 
@@ -203,10 +215,31 @@ def attach_workspace_refs(
     return task_service.serialize_task(task).model_dump(mode="json")
 
 
-@router.get("/{task_id}/report")
-def get_report(task_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    content = task_service.read_report(db, task_id)
-    return {"markdown": content}
+@router.get("/{task_id}/report", response_model=ReportDocument)
+def get_report(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    task = task_service.get_task(db, task_id)
+    revision = reports.current(db, task)
+    return {"markdown": revision.markdown, "version": revision.version, "sections": reports.sections(revision.markdown)}
+
+
+@router.get("/{task_id}/analysis", response_model=AnalysisResponse)
+def get_analysis(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"analysis": task_service.get_analysis(db, task_id)}
+
+
+@router.get("/{task_id}/report/versions", response_model=ReportVersionList)
+def list_report_versions(task_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return reports.list_versions(db, task_service.get_task(db, task_id))
+
+
+@router.get("/{task_id}/report/versions/{version}", response_model=ReportVersionPreview)
+def preview_report_version(task_id: str, version: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return reports.version_preview(db, task_service.get_task(db, task_id), version)
+
+
+@router.post("/{task_id}/report/restore", response_model=TaskOut)
+def restore_report(task_id: str, body: ReportRestore, db: Session = Depends(get_db)) -> TaskOut:
+    return _to_out(task_service.restore_report(db, task_id, body.version, body.expected_version))
 
 
 @router.get("/{task_id}/report.docx")
