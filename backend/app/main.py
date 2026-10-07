@@ -9,19 +9,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.catalog import router as catalog_router
 from app.api.feishu import router as feishu_router
 from app.api.schedules import router as schedules_router
-from app.api.tasks import router as tasks_router
+from app.api.tasks import router as tasks_router, cancel_running_jobs
 from app.api.workspace import router as workspace_router
 from app.core.config import get_settings
-from app.core.errors import register_exception_handlers
+from app.core.errors import AppError, register_exception_handlers
+from app.core.process_lock import data_lock
 from app.db import session as db_session
 from app.db.session import init_db
 from app.services.scheduler_loop import scheduler_loop
 from app.services.tasks import recover_running_tasks
+from app.services.schedules import DEFAULT_SCHEDULE_TOKEN_BUDGET, recover_schedule_runs
+from app.services.models import selection_metadata
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
+    with data_lock(settings.data_path):
+        async with service_lifespan(settings):
+            yield
+
+
+@asynccontextmanager
+async def service_lifespan(settings):
     settings.data_path.mkdir(parents=True, exist_ok=True)
     settings.uploads_path.mkdir(parents=True, exist_ok=True)
     settings.artifacts_path.mkdir(parents=True, exist_ok=True)
@@ -29,6 +39,7 @@ async def lifespan(_: FastAPI):
     db = db_session.SessionLocal()
     try:
         recover_running_tasks(db)
+        recover_schedule_runs(db)
     finally:
         db.close()
 
@@ -43,6 +54,7 @@ async def lifespan(_: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+        await cancel_running_jobs()
 
 
 def create_app() -> FastAPI:
@@ -60,6 +72,10 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health():
         s = get_settings()
+        try:
+            default_model = selection_metadata(s)["model_id"]
+        except AppError:
+            default_model = None
         return {
             "status": "ok",
             "service": "AI办公搭子",
@@ -69,6 +85,8 @@ def create_app() -> FastAPI:
             "llm_configured": bool(s.llm_api_key),
             "search_configured": bool(s.tavily_api_key),
             "llm_model": s.llm_model,
+            "default_model_id": default_model,
+            "default_schedule_token_budget": DEFAULT_SCHEDULE_TOKEN_BUDGET,
         }
 
     app.include_router(tasks_router)

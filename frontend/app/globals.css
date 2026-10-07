@@ -1,6 +1,12 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss" source(none);
+@source "./**/*.{ts,tsx}";
+@source "../components/**/*.{ts,tsx}";
+
+/* Preserve the v3 preflight defaults while moving the compiler to v4. */
+@layer base {
+  *, ::before, ::after, ::backdrop { border-color: var(--color-gray-200, currentColor); }
+  button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
+}
 
 :root {
   --ink: #111118;
@@ -86,7 +92,7 @@ body {
 }
 
 .btn-primary {
-  @apply btn text-white;
+  @apply inline-flex items-center justify-center rounded-md px-3.5 py-2 text-sm transition disabled:opacity-40 text-white;
   background: var(--accent);
 }
 
@@ -95,7 +101,7 @@ body {
 }
 
 .btn-ghost {
-  @apply btn bg-transparent;
+  @apply inline-flex items-center justify-center rounded-md px-3.5 py-2 text-sm transition disabled:opacity-40 bg-transparent;
   color: var(--ink);
   border: 1px solid var(--line-strong);
 }
@@ -105,7 +111,7 @@ body {
 }
 
 .btn-danger {
-  @apply btn;
+  @apply inline-flex items-center justify-center rounded-md px-3.5 py-2 text-sm transition disabled:opacity-40;
   color: var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
 }

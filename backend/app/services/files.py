@@ -14,6 +14,8 @@ from app.core.errors import AppError
 ALLOWED_EXT = {".md", ".txt", ".markdown", ".pdf", ".docx", ".csv", ".xlsx"}
 MAX_BYTES = 20 * 1024 * 1024
 MAX_FILES = 3
+MAX_DOCUMENT_CHARS = 60000
+MAX_REFERENCE_CHARS = 90000
 
 
 def safe_filename(name: str) -> str:
@@ -72,9 +74,22 @@ def extract_xlsx_text(path: Path, max_chars: int = 12000) -> str:
         wb.close()
 
 
-def extract_text(path: Path, ext: str, max_chars: int = 12000) -> str:
+def _complete_document(text: str, limit: int) -> str:
+    if not text.strip():
+        raise AppError("DOCUMENT_EMPTY", "文件没有可读取正文；扫描件请先转成文字，当前不支持 OCR")
+    if len(text) > limit:
+        raise AppError("DOCUMENT_TOO_LARGE", f"正文共 {len(text):,} 字符，超过单份材料 {limit:,} 字符上限，请拆分后重试；未截取或提交部分正文")
+    return text
+
+
+def extract_text(path: Path, ext: str, max_chars: int = MAX_DOCUMENT_CHARS) -> str:
+    """Documents are complete within an explicit bound; table text is a labelled preview."""
     if ext in {".txt", ".md", ".markdown"}:
-        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="gb18030")
+        return _complete_document(text, max_chars)
     if ext == ".csv":
         return extract_csv_text(path.read_bytes(), max_chars=max_chars)
     if ext == ".xlsx":
@@ -84,15 +99,62 @@ def extract_text(path: Path, ext: str, max_chars: int = 12000) -> str:
 
         reader = PdfReader(str(path))
         parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts)[:max_chars]
+        has_text = False
+        for number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            has_text = has_text or bool(text.strip())
+            parts.append(text if text.strip() else f"[第 {number} 页无可提取文字，可能为空白页或图片；本页未进行 OCR]")
+        if not has_text:
+            raise AppError("DOCUMENT_EMPTY", "PDF 没有可读取文字；扫描件请先进行 OCR")
+        return _complete_document("\n".join(parts), max_chars)
     if ext == ".docx":
         import docx
 
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+
         doc = docx.Document(str(path))
-        return "\n".join(p.text for p in doc.paragraphs)[:max_chars]
+        def blocks(parent, elements):
+            parts = []
+            for element in elements:
+                if element.tag.endswith("}p"):
+                    parts.append(Paragraph(element, parent).text)
+                elif element.tag.endswith("}tbl"):
+                    table = Table(element, parent)
+                    parts.append("\n".join(" | ".join(blocks(cell, cell._tc) for cell in row.cells) for row in table.rows))
+            return "\n".join(parts)
+        return _complete_document(blocks(doc, doc.element.body), max_chars)
     return ""
+
+
+def task_document_context(uploads) -> str:
+    parts = []
+    for upload in uploads:
+        ext = Path(upload.filename).suffix.lower()
+        if ext in {".csv", ".xlsx"}:
+            continue
+        path = Path(upload.stored_path)
+        if not path.is_file():
+            raise AppError("MATERIAL_MISSING", f"材料「{upload.filename}」缺失，请重新添加")
+        try:
+            text = extract_text(path, ext)
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("UPLOAD_INVALID", f"材料「{upload.filename}」无法读取，请检查格式或加密状态") from exc
+        parts.append(f"【材料：{upload.filename}】\n{text}")
+    result = "\n---\n".join(parts)
+    if len(result) > MAX_REFERENCE_CHARS:
+        raise AppError("MATERIALS_TOO_LARGE", f"本次材料合计超过 {MAX_REFERENCE_CHARS:,} 字符，请分成多个任务；未截断材料")
+    return result
+
+
+def join_context(parts: list[str], max_chars: int = 120000) -> str:
+    """Reuse repeated source blocks once, never discard the beginning/end silently."""
+    result = "\n---\n".join(dict.fromkeys(part for part in parts if part.strip()))
+    if len(result) > max_chars:
+        raise AppError("CONTEXT_TOO_LARGE", "任务上下文超过处理上限，请减少材料或拆分任务；未截断材料")
+    return result
 
 
 def atomic_write_text(path: Path, content: str) -> None:

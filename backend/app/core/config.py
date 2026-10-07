@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_mock: bool = True
     llm_price_per_1k_cny: float = 0.02
+    llm_max_output_tokens: int = 4096
+    llm_max_attempts: int = 3
+    llm_retry_base_seconds: float = 0.5
 
     # Independent provider profiles. Credentials never leave the server.
     deepseek_api_key: str = ""

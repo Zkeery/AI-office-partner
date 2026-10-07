@@ -66,7 +66,28 @@ def resolve_model(settings: Settings, model_id: str, model_name: str | None = No
                                        "llm_base_url": base, "llm_model": model_name or configured_model})
 
 
-def selection_metadata(settings: Settings, model_id: str, model_name: str | None = None) -> dict[str, str]:
+def default_model_id(settings: Settings) -> str:
+    """Use the administrator's explicit global configuration, never catalog order."""
+    if settings.llm_mock:
+        return "mock"
+    try:
+        provider = _legacy_provider(settings)
+    except ValueError:
+        provider = None
+    if provider and all(value.strip() for value in (
+        settings.llm_api_key, settings.llm_base_url, settings.llm_model,
+    )):
+        return provider
+    raise AppError(
+        "DEFAULT_MODEL_NOT_CONFIGURED",
+        "默认模型尚未配置，请联系管理员完成模型接入。",
+        status_code=422,
+    )
+
+
+def selection_metadata(settings: Settings, model_id: str | None = None, model_name: str | None = None) -> dict[str, str]:
+    if model_id is None:
+        model_id = default_model_id(settings)
     resolved = resolve_model(settings, model_id, model_name)
     return {"model_id": model_id, "model_name": resolved.llm_model,
             "model_label": "模拟测试" if model_id == "mock" else PROVIDERS[model_id][0]}

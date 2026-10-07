@@ -1,0 +1,8 @@
+{
+  "date": "2026-10-04",
+  "backend_clean_install": { "tests_passed": 158, "duration_seconds": 20.93, "pip_check": "No broken requirements found", "warning": "1 existing Starlette TestClient/httpx deprecation warning; no failing tests", "note": "最终代码在全新 Python 3.12 锁定环境重跑全量通过" },
+  "frontend": { "next": "16.3.8", "react": "19.3.0", "tailwind": "4.3.3", "npm_audit_vulnerabilities": 0, "unit_tests_passed": 3, "browser_workflows_passed": 5, "schedule_editor_recheck_passed": 1, "lint": "0 errors, 0 warnings", "typecheck": "passed", "build": "passed; final production build served at localhost:3040", "browser_isolation": "temporary database and uploads, mock model/search/Feishu, notifications off" },
+  "backup": { "path": "backups/2026-10-04-before-chain-repair", "files": 1996, "restored_files_verified": 1996, "sqlite_integrity": "ok", "restored_schedules": "disabled" },
+  "real_provider": { "model": "deepseek-chat", "task_id": "b74dd4ad-40f9-4ca0-90df-a784a465ea5a", "status": "succeeded", "calls": 4, "prompt_tokens": 1426, "completion_tokens": 632, "total_tokens": 2058, "unknown_calls": 0, "simulated_calls": 0, "input": "synthetic repair acceptance notice; no private materials or outbound messaging" },
+  "legacy_schedules": { "retained": 4, "setup_required": 4, "reason": "model and per-run token budget were never selected" }
+}

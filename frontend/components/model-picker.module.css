@@ -24,8 +24,8 @@
 .root[data-variant=composer]{min-width:0;flex-shrink:1}
 .root[data-variant=composer] .trigger{gap:8px;min-height:40px;max-width:100%;padding:4px 6px;border:0;border-radius:9px;background:transparent;color:#3e3549;font-size:16px;font-weight:500}
 .root[data-variant=composer] .trigger:hover{background:#f6f0fd}
-.bolt{color:#8050bd;flex:none}
-.modelTag{color:#8b4eed;font-weight:450;flex:none}
+.bolt{color:var(--accent,#8050bd);flex:none}
+.modelTag{color:var(--accent,#8b4eed);font-weight:450;flex:none}
 @media(min-width:601px){.root[data-variant=composer] .panel{left:0;right:auto}}
 @media(max-width:600px){.root[data-variant=composer] .trigger{font-size:13px;gap:5px;padding:3px;min-height:36px}.root[data-variant=composer] .bolt{width:16px;height:16px}.root[data-variant=composer] .chevron{width:12px;height:12px}}
 @media(max-width:600px){.root .trigger{font-size:12px;padding:6px 9px}.root .panel,.root .panel[data-above=true]{position:fixed;top:auto;bottom:18px;left:18px;right:18px;width:auto;max-width:none;box-shadow:0 0 0 100vmax #30273838,0 16px 45px #352d4126}.root .option{padding:12px 8px}}

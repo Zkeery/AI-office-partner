@@ -20,7 +20,7 @@ class PlanOut(BaseModel):
 
 class TaskCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=8000)
-    model_id: str = Field(min_length=1, max_length=80)
+    model_id: str | None = Field(default=None, min_length=1, max_length=80)
     urls: list[str] = Field(default_factory=list, max_length=3)
     skill_id: str | None = None
     expert_id: str | None = None
@@ -61,6 +61,7 @@ class UploadOut(BaseModel):
 
 
 class TaskOut(BaseModel):
+    usage: dict[str, Any] = Field(default_factory=dict)
     id: str
     title: str
     user_prompt: str

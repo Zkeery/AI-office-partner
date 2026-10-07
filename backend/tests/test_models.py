@@ -41,7 +41,7 @@ def test_catalog_lists_four_providers_without_exposing_credentials(client):
 
 
 @pytest.mark.parametrize("endpoint", ["/api/tasks", "/api/schedules"])
-@pytest.mark.parametrize("selection", [{}, {"model_id": ""}, {"model_id": "unknown"}, {"model_id": "doubao"}])
+@pytest.mark.parametrize("selection", [{"model_id": ""}, {"model_id": "unknown"}, {"model_id": "doubao"}])
 def test_new_work_requires_a_valid_configured_selection(client, endpoint, selection):
     response = client.post(endpoint, json={"prompt": "模型选择验收", **selection})
     assert response.status_code == 422
@@ -88,8 +88,9 @@ def test_missing_key_and_upstream_errors_do_not_fall_back_to_mock(monkeypatch):
     client_class = httpx.AsyncClient
     monkeypatch.setattr(llm.httpx, "AsyncClient", lambda **kw: client_class(
         transport=httpx.MockTransport(lambda req: httpx.Response(401, json={"error": "invalid key"})), **kw))
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(AppError) as error:
         asyncio.run(llm.chat_completion(isolated_settings(llm_api_key="invalid"), "system", "user"))
+    assert error.value.code == "LLM_AUTH_FAILED"
 
 
 def test_tasks_keep_model_through_replan_execution_and_rewrite(client, monkeypatch):

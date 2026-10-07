@@ -26,6 +26,7 @@ from app.schemas.tasks import (
 )
 from app.services import tasks as task_service
 from app.services import reports
+from app.services.execution import claim_task
 from app.schemas.reports import (
     AnalysisResponse,
     ReportDocument,
@@ -37,6 +38,15 @@ from app.schemas.reports import (
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 _running_jobs: dict[str, asyncio.Task] = {}
+
+
+async def cancel_running_jobs() -> None:
+    jobs = list(_running_jobs.values())
+    for job in jobs:
+        job.cancel()
+    if jobs:
+        await asyncio.gather(*jobs, return_exceptions=True)
+    _running_jobs.clear()
 
 
 def _to_out(task) -> TaskOut:
@@ -88,18 +98,19 @@ def get_task(task_id: str, db: Session = Depends(get_db)) -> TaskOut:
 
 @router.post("/{task_id}/plan", response_model=TaskOut)
 async def rebuild_plan(task_id: str, db: Session = Depends(get_db)) -> TaskOut:
-    task = await task_service.generate_plan(db, task_id)
+    task = await task_service.replan_task(db, task_id)
     return _to_out(task)
 
 
-async def _run_job(task_id: str) -> None:
+async def _run_job(task_id: str, operation_token: str) -> None:
     settings = get_settings()
     db = db_session.SessionLocal()
     try:
-        await task_service.run_agent_job(db, task_id, settings)
+        await task_service.run_agent_job(db, task_id, settings, operation_token=operation_token)
     finally:
         db.close()
-        _running_jobs.pop(task_id, None)
+        if _running_jobs.get(task_id) is asyncio.current_task():
+            _running_jobs.pop(task_id, None)
 
 
 @router.post("/{task_id}/confirm", response_model=TaskOut)
@@ -123,21 +134,27 @@ async def confirm_task(
         if body.confirm_cost:
             task.cost_confirmed = True
 
-    task.status = "running"
-    task.error_code = None
-    task.error_message = None
+    if not task.steps:
+        raise AppError("PLAN_REQUIRED", "计划尚未完成，请先改计划后重试")
+    token = claim_task(db, task, allowed={"plan_ready", "paused", "failed"}, state="running")
     task_service.append_event(db, task, "progress", {"message": "开始执行"})
     db.commit()
 
-    if task_id not in _running_jobs or _running_jobs[task_id].done():
-        _running_jobs[task_id] = asyncio.create_task(_run_job(task_id))
+    previous = _running_jobs.get(task_id)
+    if previous and not previous.done():
+        previous.cancel()
+    _running_jobs[task_id] = asyncio.create_task(_run_job(task_id, token))
 
     return _to_out(task_service.get_task(db, task_id))
 
 
 @router.post("/{task_id}/pause", response_model=TaskOut)
 def pause_task(task_id: str, db: Session = Depends(get_db)) -> TaskOut:
-    return _to_out(task_service.pause_task(db, task_id))
+    task = task_service.pause_task(db, task_id)
+    job = _running_jobs.get(task_id)
+    if job and not job.done():
+        job.cancel()
+    return _to_out(task)
 
 
 @router.post("/{task_id}/resume", response_model=TaskOut)

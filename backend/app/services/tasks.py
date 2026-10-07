@@ -17,12 +17,15 @@ from app.core.errors import AppError
 from app.db.models import Task, TaskEvent, TaskStep, Upload, utcnow
 from app.schemas.tasks import PlanOut, StepOut, TaskOut, UploadOut
 from app.services.costing import estimate_cost_cny
+from app.services.execution import assert_owner, claim_task
 from app.services.files import (
     MAX_BYTES,
     MAX_FILES,
     assert_allowed,
     atomic_write_text,
     extract_text,
+    task_document_context,
+    join_context,
     read_upload_bytes,
     safe_filename,
 )
@@ -31,6 +34,7 @@ from app.services.models import selection_metadata, task_settings
 from app.services.office_speed import accelerate_plan, is_write_skill
 from app.services.search import fetch_url_text, web_search
 from app.services import reports, table_analysis
+from app.services.usage import track_calls, usage_summary
 
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
@@ -131,6 +135,7 @@ def serialize_task(task: Task, *, search_query: str | None = None) -> TaskOut:
         search_snippet=snippet,
         error_code=task.error_code,
         error_message=task.error_message,
+        usage=usage_summary(task.model_calls),
         created_at=task.created_at,
         updated_at=task.updated_at,
     )
@@ -448,11 +453,21 @@ def append_event(db: Session, task: Task, event_type: str, payload: dict[str, An
 
 
 def recover_running_tasks(db: Session) -> int:
-    tasks = list(db.scalars(select(Task).where(Task.status == "running")))
+    tasks = list(db.scalars(select(Task).where(Task.status.in_({"running", "planning"}))))
     for task in tasks:
-        task.status = "paused"
+        was_planning = task.status == "planning"
+        task.status = "failed" if was_planning else "paused"
+        task.operation_token = str(uuid.uuid4())
         task.updated_at = utcnow()
-        append_event(db, task, "progress", {"message": "服务重启，任务已暂停，可点继续"})
+        if was_planning:
+            task.error_code = "PLANNING_INTERRUPTED"
+            task.error_message = "服务中断了计划生成，请点击改计划后重试"
+            append_event(db, task, "error", {"code": task.error_code, "message": task.error_message})
+        else:
+            for step in task.steps:
+                if step.status == "running":
+                    step.status = "pending"
+            append_event(db, task, "progress", {"message": "服务重启，任务已暂停，可点继续"})
     if tasks:
         db.commit()
     return len(tasks)
@@ -468,11 +483,13 @@ async def create_task(
     source_schedule_id: str | None = None,
     model_id: str | None = None,
     model_name: str | None = None,
+    task_id: str | None = None,
+    defer_plan: bool = False,
 ) -> Task:
-    from app.services.catalog import resolve_skill_and_expert
+    from app.services.catalog import resolve_creation_capabilities
 
     settings = settings or get_settings()
-    skill, expert = resolve_skill_and_expert(skill_id, expert_id)
+    skill, expert = resolve_creation_capabilities(prompt, skill_id, expert_id)
     meta = {
         "urls": urls,
         "skill_id": skill["id"] if skill else None,
@@ -480,36 +497,41 @@ async def create_task(
     }
     if source_schedule_id:
         meta["source_schedule_id"] = source_schedule_id
-    if model_id is not None:
-        meta.update(selection_metadata(settings, model_id, model_name))
+    meta.update(selection_metadata(settings, model_id, model_name))
     task = Task(
-        id=str(uuid.uuid4()),
+        id=task_id or str(uuid.uuid4()),
         title="",
         user_prompt=prompt.strip(),
-        status="planning",
+        status="draft",
         plan_json=json.dumps(meta, ensure_ascii=False),
     )
     db.add(task)
     db.commit()
     db.refresh(task)
-    await generate_plan(db, task.id, urls=urls, settings=settings)
+    if not defer_plan:
+        await generate_plan(db, task.id, urls=urls, settings=settings)
     return get_task(db, task.id)
 
 
+@track_calls("planning")
 async def generate_plan(
     db: Session,
     task_id: str,
     urls: list[str] | None = None,
     settings: Settings | None = None,
+    prompt: str | None = None,
 ) -> Task:
     from app.services.catalog import resolve_skill_and_expert
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
     settings = task_settings(settings, _plan_meta(task))
-    task.status = "planning"
-    task.error_code = None
-    task.error_message = None
+    if prompt is not None and not prompt.strip():
+        raise AppError("VALIDATION_ERROR", "请填写任务内容")
+    token = claim_task(db, task, allowed={"draft", "plan_ready", "paused", "failed"}, state="planning")
+    if prompt is not None:
+        task.user_prompt = prompt.strip()
+    task.report_path = None
     db.commit()
 
     existing = {}
@@ -541,10 +563,20 @@ async def generate_plan(
     for _ in range(3):
         try:
             raw = await chat_completion(settings, system, user)
+            assert_owner(db, task, token, state="planning")
             plan_dict = _parse_plan(raw)
             plan_dict = accelerate_plan(plan_dict, skill_id)
             break
-        except Exception:
+        except AppError as exc:
+            if exc.code == "TASK_SUPERSEDED":
+                raise
+            assert_owner(db, task, token, state="planning")
+            task.status = "failed"
+            task.error_code, task.error_message = exc.code, exc.message
+            append_event(db, task, "error", {"code": exc.code, "message": exc.message})
+            db.commit()
+            raise
+        except (ValueError, TypeError, KeyError):
             plan_dict = None
     if plan_dict is None:
         task.status = "failed"
@@ -554,6 +586,7 @@ async def generate_plan(
         db.commit()
         raise AppError("PLAN_FAILED", "计划生成失败，请重试", status_code=500)
 
+    assert_owner(db, task, token, state="planning")
     cost = estimate_cost_cny(settings, plan_dict)
     task.title = plan_dict.get("title") or "调研任务"
     plan_payload = {
@@ -568,6 +601,9 @@ async def generate_plan(
     # 保留自动化来源，供 1.22 A→B 事件触发关联
     if existing.get("source_schedule_id"):
         plan_payload["source_schedule_id"] = existing["source_schedule_id"]
+    for key in ("schedule_run_id", "upstream_run_id"):
+        if existing.get(key):
+            plan_payload[key] = existing[key]
     task.plan_json = json.dumps(plan_payload, ensure_ascii=False)
     task.cost_estimate_cny = cost
     task.cost_confirmed = False
@@ -606,21 +642,7 @@ async def replan_task(
 ) -> Task:
     """Regenerate plan for plan_ready / paused / failed tasks."""
     settings = settings or get_settings()
-    task = get_task(db, task_id)
-    if task.status not in {"plan_ready", "paused", "failed"}:
-        raise AppError("INVALID_STATE", f"当前状态不可改计划：{task.status}")
-    if prompt is not None:
-        text = prompt.strip()
-        if not text:
-            raise AppError("VALIDATION_ERROR", "请填写任务内容")
-        task.user_prompt = text
-    task.report_path = None
-    task.error_code = None
-    task.error_message = None
-    db.commit()
-    append_event(db, task, "progress", {"message": "正在按新需求重新生成计划"})
-    db.commit()
-    return await generate_plan(db, task_id, urls=urls, settings=settings)
+    return await generate_plan(db, task_id, urls=urls, settings=settings, prompt=prompt)
 
 
 async def confirm_and_run(
@@ -646,24 +668,32 @@ async def confirm_and_run(
         if confirm_cost:
             task.cost_confirmed = True
 
-    task.status = "running"
-    task.error_code = None
-    task.error_message = None
+    if not task.steps:
+        raise AppError("PLAN_REQUIRED", "计划尚未完成，请先改计划后重试")
+    token = claim_task(db, task, allowed={"plan_ready", "paused", "failed"}, state="running")
     append_event(db, task, "progress", {"message": "开始执行"})
     db.commit()
-    await run_agent_job(db, task_id, settings)
+    await run_agent_job(db, task_id, settings, operation_token=token)
     return get_task(db, task_id)
 
 
-async def run_agent_job(db: Session, task_id: str, settings: Settings | None = None) -> None:
+@track_calls("execution")
+async def run_agent_job(db: Session, task_id: str, settings: Settings | None = None, *, operation_token: str | None = None) -> None:
     settings = settings or get_settings()
+    task = get_task(db, task_id)
+    token = operation_token or task.operation_token
     try:
+        assert_owner(db, task, token, state="running")
         settings = task_settings(settings, _plan_meta(get_task(db, task_id)))
         await _execute_agent(db, task_id, settings)
     except AppError as exc:
-        if exc.code == "TASK_NOT_FOUND":
+        if exc.code in {"TASK_NOT_FOUND", "TASK_SUPERSEDED"}:
             return
         task = get_task(db, task_id)
+        try:
+            assert_owner(db, task, token, state="running")
+        except AppError:
+            return
         if task.status != "paused":
             _mark_step_failed(task, exc.code, exc.message)
             task.status = "failed"
@@ -676,6 +706,7 @@ async def run_agent_job(db: Session, task_id: str, settings: Settings | None = N
     except Exception:
         try:
             task = get_task(db, task_id)
+            assert_owner(db, task, token, state="running")
         except AppError:
             return
         if task.status != "paused":
@@ -699,6 +730,7 @@ def _mark_step_failed(task: Task, code: str, message: str) -> None:
 
 
 async def _ensure_table_analysis(db: Session, task: Task, settings: Settings) -> dict[str, Any] | None:
+    token = task.operation_token
     meta = _plan_meta(task)
     uploads = [
         {"filename": upload.filename, "stored_path": upload.stored_path}
@@ -715,6 +747,7 @@ async def _ensure_table_analysis(db: Session, task: Task, settings: Settings) ->
         analysis_id = await asyncio.to_thread(
             table_analysis.build_snapshot, uploads, settings.artifacts_path / task.id, task.user_prompt
         )
+        assert_owner(db, task, token)
         meta["analysis_id"] = analysis_id
         _save_plan_meta(task, meta)
         append_event(db, task, "artifact", {"kind": "table_analysis", "analysis_id": analysis_id})
@@ -723,23 +756,17 @@ async def _ensure_table_analysis(db: Session, task: Task, settings: Settings) ->
 
 
 async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
-    from app.services.workspace import collect_workspace_excerpts
-
     task = get_task(db, task_id)
+    token = task.operation_token
     plan = json.loads(task.plan_json or "{}")
     urls = plan.get("urls") or []
     skill_id = plan.get("skill_id")
     write_fast = is_write_skill(skill_id)
     search_bits: list[str] = []
     # Table previews are never used as a substitute for full-data calculations.
-    ref_texts = [
-        (u.text_excerpt or "").strip()
-        for u in task.uploads
-        if (u.text_excerpt or "").strip() and Path(u.filename).suffix.lower() not in {".csv", ".xlsx"}
-    ]
-    if ref_texts:
-        joined = "\n---\n".join(ref_texts)[:12000]
-        search_bits.append("用户添加的参考材料：\n" + joined)
+    references = task_document_context(task.uploads)
+    if references:
+        search_bits.append(references)
         append_event(db, task, "progress", {"message": "已读取用户添加的参考材料"})
         db.commit()
     steps = list(task.steps)
@@ -752,10 +779,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
     for idx, step in enumerate(steps, start=1):
         db.refresh(task)
         task = get_task(db, task_id)
-        if task.status == "paused":
-            append_event(db, task, "progress", {"message": "已暂停"})
-            db.commit()
-            return
+        assert_owner(db, task, token)
 
         if step.status in {"done", "skipped"}:
             try:
@@ -787,6 +811,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
             else:
                 query = (detail.get("goal") or task.user_prompt)[:300]
                 results = await web_search(settings, query)
+                assert_owner(db, task, token)
                 context = json.dumps(results, ensure_ascii=False)
                 detail["results"] = results
                 detail["evidence"] = f"已检索并取得 {len(results)} 条结果" if results else "已执行检索，未找到公开来源；报告须标待核实"
@@ -800,6 +825,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
                 parts = []
                 for url in urls:
                     text = await fetch_url_text(url)
+                    assert_owner(db, task, token)
                     if not text.strip():
                         raise AppError("EMPTY_SOURCE", "参考网页没有可读取正文，请更换链接")
                     parts.append(f"来源：{url}\n{text}")
@@ -809,30 +835,26 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
             analysis = await _ensure_table_analysis(db, task, settings)
             if hint == "analyze_tables" and analysis is None:
                 raise AppError("TABLE_REQUIRED", "请添加 CSV 或 XLSX 数据后再执行表格计算")
-            texts = [u.text_excerpt or "" for u in task.uploads if Path(u.filename).suffix.lower() not in {".csv", ".xlsx"}]
-            context = "\n".join(texts)[:12000]
+            context = references
             detail["evidence"] = f"已读取 {len(task.uploads)} 份参考材料"
             if analysis:
                 detail["analysis_id"] = analysis["id"]
                 detail["evidence"] = f"已完整计算 {analysis['source_count']} 个文件、{analysis['sheet_count']} 个工作表、{analysis['row_count']} 行数据"
             if hint == "read_workspace":
-                extra = collect_workspace_excerpts(settings)
-                if extra:
-                    context += "\n" + extra
-                    detail["workspace_chars"] = len(extra)
-                    detail["evidence"] = f"已读取授权目录摘录 {len(extra)} 字符；该步骤不是全目录数据分析"
+                detail["evidence"] += "；只读取本次已选材料的快照，未扫描资料库目录"
             if not context.strip() and analysis is None:
                 outcome = "skipped"
                 detail["evidence"] = "没有可读取的参考材料，本次仅依据用户描述起草"
         elif hint == "analyze":
             analysis = await _ensure_table_analysis(db, task, settings)
-            material = table_analysis.prompt_summary(analysis) if analysis else "\n---\n".join(search_bits)[-24000:]
+            material = join_context(search_bits + ([table_analysis.prompt_summary(analysis)] if analysis else []))
             raw = await chat_completion(
                 settings,
                 "[EXECUTION_ANALYSIS] 根据已提供的需求和材料完成当前分析/结构组织步骤。输出严格 JSON："
                 '{"summary":"非空的分析结论","findings":["要点"]}。不能声称使用了其他工具；缺少来源就写待核实。',
                 f"需求：{task.user_prompt}\n步骤：{step.name}\n目标：{detail.get('goal', '')}\n材料：{material}",
             )
+            assert_owner(db, task, token)
             try:
                 clean = raw.strip().removeprefix(chr(96) * 3 + "json").removeprefix(chr(96) * 3).removesuffix(chr(96) * 3).strip()
                 parsed = json.loads(clean)
@@ -840,7 +862,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
                     raise ValueError("missing summary")
                 if not isinstance(parsed.get("findings"), list) or not all(isinstance(item, str) for item in parsed["findings"]):
                     raise ValueError("invalid findings")
-                context = (parsed["summary"] + "\n" + "\n".join(parsed["findings"]))[:12000]
+                context = parsed["summary"] + "\n" + "\n".join(parsed["findings"])
             except (ValueError, TypeError, KeyError) as exc:
                 raise AppError("ANALYSIS_INVALID", "本步骤未返回有效分析结果，请重试") from exc
             detail["evidence"] = "已生成可查看的分析结论与要点"
@@ -848,6 +870,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
         elif hint == "write_report":
             analysis = await _ensure_table_analysis(db, task, settings)
             report = await _write_report(settings, task, search_bits)
+            assert_owner(db, task, token)
             reports.validate_markdown(report)
             art_dir = settings.artifacts_path / task.id
             report_path = art_dir / "report.md"
@@ -861,6 +884,7 @@ async def _execute_agent(db: Session, task_id: str, settings: Settings) -> None:
         else:
             raise AppError("TOOL_UNSUPPORTED", f"步骤「{step.name}」要求的操作暂不支持，请改计划后重试")
 
+        assert_owner(db, task, token)
         if context:
             search_bits.append(context)
             detail["context"] = context
@@ -907,7 +931,7 @@ async def _write_report(settings: Settings, task: Task, search_bits: list[str]) 
     user = (
         f"用户需求：\n{task.user_prompt}\n\n"
         f"计划：\n{task.plan_json}\n\n"
-        f"已收集摘录：\n" + "\n---\n".join(search_bits)[-40000:]
+        f"已收集材料：\n" + join_context(search_bits)
     )
     if meta.get("analysis_id"):
         analysis = table_analysis.load_snapshot(settings.artifacts_path / task.id, meta["analysis_id"])["summary"]
@@ -916,6 +940,7 @@ async def _write_report(settings: Settings, task: Task, search_bits: list[str]) 
     return await chat_completion(settings, system, user)
 
 
+@track_calls("rewrite")
 async def rewrite_report(
     db: Session,
     task_id: str,
@@ -1025,7 +1050,15 @@ def pause_task(db: Session, task_id: str) -> Task:
     task = get_task(db, task_id)
     if task.status != "running":
         raise AppError("INVALID_STATE", "仅运行中的任务可暂停")
-    task.status = "paused"
+    claim_task(db, task, allowed={"running"}, state="paused")
+    from app.db.models import Schedule, ScheduleRun
+    run_id = _plan_meta(task).get("schedule_run_id")
+    run = db.get(ScheduleRun, run_id) if run_id else None
+    if run and run.status == "running":
+        run.status, run.error, run.finished_at = "paused", "RUN_PAUSED: 用户暂停", utcnow()
+        schedule = db.get(Schedule, run.schedule_id)
+        if schedule and schedule.active_run_id == run.id:
+            schedule.last_error, schedule.last_task_id = run.error, task.id
     append_event(db, task, "progress", {"message": "用户暂停"})
     db.commit()
     return get_task(db, task_id)
@@ -1057,7 +1090,7 @@ async def add_upload(db: Session, task_id: str, upload_file, settings: Settings 
     task = get_task(db, task_id)
     if len(task.uploads) >= MAX_FILES:
         raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
-    if task.status not in {"plan_ready", "paused", "failed"}:
+    if task.status not in {"draft", "plan_ready", "paused", "failed"}:
         raise AppError("INVALID_STATE", "请在任务开始前添加材料")
     if any(step.status in {"done", "skipped"} for step in task.steps):
         raise AppError("MATERIAL_CHANGE_REQUIRES_REPLAN", "部分步骤已执行，请先改计划，再添加新材料")
@@ -1071,6 +1104,9 @@ async def add_upload(db: Session, task_id: str, upload_file, settings: Settings 
     dest.write_bytes(data)
     try:
         excerpt = extract_text(dest, ext)
+    except AppError:
+        dest.unlink(missing_ok=True)
+        raise
     except Exception:
         dest.unlink(missing_ok=True)
         raise AppError("UPLOAD_INVALID", "文件内容无法读取，请检查格式或是否已加密")
@@ -1100,7 +1136,7 @@ def add_workspace_refs(
 
     settings = settings or get_settings()
     task = get_task(db, task_id)
-    if task.status not in {"plan_ready", "paused", "failed"}:
+    if task.status not in {"draft", "plan_ready", "paused", "failed"}:
         raise AppError("INVALID_STATE", "当前状态不可再添加参考材料")
     if any(step.status in {"done", "skipped"} for step in task.steps):
         raise AppError("MATERIAL_CHANGE_REQUIRES_REPLAN", "部分步骤已执行，请先改计划，再添加新材料")
@@ -1110,35 +1146,34 @@ def add_workspace_refs(
     root = ws.require_root(settings)
     dest_dir = settings.uploads_path / task.id
     dest_dir.mkdir(parents=True, exist_ok=True)
-    used = len(task.uploads)
-
-    for rel in paths:
-        if used >= MAX_FILES:
-            raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
-        src = ws.safe_resolve(root, rel)
-        if not src.is_file():
-            raise AppError("FILE_NOT_FOUND", f"资料库文件不存在：{rel}", status_code=404)
-        filename = safe_filename(src.name)
-        ext = assert_allowed(filename)
-        size = src.stat().st_size
-        if size > MAX_BYTES:
-            raise AppError("UPLOAD_TOO_LARGE", f"{filename} 超过 20MB")
-        dest = dest_dir / f"{uuid.uuid4().hex}_{filename}"
-        dest.write_bytes(src.read_bytes())
-        excerpt = extract_text(dest, ext)
-        row = Upload(
-            task_id=task.id,
-            filename=filename,
-            stored_path=str(dest),
-            mime="application/octet-stream",
-            size_bytes=size,
-            text_excerpt=excerpt,
-        )
-        db.add(row)
-        used += 1
-        append_event(db, task, "progress", {"message": f"已从资料库添加 {filename}"})
-
-    db.commit()
+    if len(task.uploads) + len(paths) > MAX_FILES:
+        raise AppError("UPLOAD_LIMIT", "最多上传 3 个参考文件")
+    copied = []
+    try:
+        for rel in paths:
+            src = ws.safe_resolve(root, rel)
+            if not src.is_file():
+                raise AppError("FILE_NOT_FOUND", f"资料库文件不存在：{rel}", status_code=404)
+            filename = safe_filename(src.name)
+            ext = assert_allowed(filename)
+            if src.stat().st_size > MAX_BYTES:
+                raise AppError("UPLOAD_TOO_LARGE", f"{filename} 超过 20MB")
+            data = src.read_bytes()
+            if len(data) > MAX_BYTES:
+                raise AppError("UPLOAD_TOO_LARGE", f"{filename} 超过 20MB")
+            dest = dest_dir / f"{uuid.uuid4().hex}_{filename}"
+            copied.append(dest)
+            dest.write_bytes(data)
+            excerpt = extract_text(dest, ext)
+            db.add(Upload(task_id=task.id, filename=filename, stored_path=str(dest),
+                          mime="application/octet-stream", size_bytes=len(data), text_excerpt=excerpt))
+            append_event(db, task, "progress", {"message": f"已从资料库添加 {filename}"})
+        db.commit()
+    except Exception:
+        db.rollback()
+        for dest in copied:
+            dest.unlink(missing_ok=True)
+        raise
     return get_task(db, task_id)
 
 

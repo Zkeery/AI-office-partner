@@ -1,32 +1,47 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import secrets
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.db.models import Schedule, ScheduleRun, utcnow
+from app.db.models import ModelCall, Schedule, ScheduleRun, Task, utcnow
 from app.services import tasks as task_service
 from app.services.models import selection_metadata
+from app.services.catalog import resolve_creation_capabilities
+from app.services.schedule_inputs import attach_run_inputs, configure_inputs, read_config
+from app.services.usage import run_usage
 
 TRIGGER_INTERVAL = "interval"
 TRIGGER_ON_TASK_SUCCEEDED = "on_task_succeeded"
 VALID_TRIGGER_MODES = frozenset({TRIGGER_INTERVAL, TRIGGER_ON_TASK_SUCCEEDED})
+DEFAULT_SCHEDULE_TOKEN_BUDGET = 50_000
 
 
 def serialize_schedule(row: Schedule) -> dict[str, Any]:
     token = getattr(row, "hook_token", None) or None
+    inputs = read_config(row)
     return {
         "id": row.id,
         "name": row.name,
         "prompt": row.prompt,
         "model_id": row.model_id,
         "model_name": row.model_name,
+        "token_budget": row.token_budget or DEFAULT_SCHEDULE_TOKEN_BUDGET,
+        "active_run_id": row.active_run_id,
+        "setup_required": not row.model_id,
+        "urls": inputs.get("urls", []),
+        "workspace_paths": [item["path"] for item in inputs.get("bindings", [])],
+        "material_mode": inputs.get("material_mode", "snapshot"),
+        "include_upstream_result": inputs.get("include_upstream_result", False),
         "skill_id": row.skill_id,
         "expert_id": row.expert_id,
         "interval_minutes": row.interval_minutes,
@@ -51,10 +66,14 @@ def serialize_run(row: ScheduleRun) -> dict[str, Any]:
         "schedule_id": row.schedule_id,
         "task_id": row.task_id,
         "started_at": row.started_at.isoformat() if row.started_at else None,
-        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at and row.status != "running" else None,
         "status": row.status,
         "error": row.error,
         "trigger": row.trigger,
+        "input_manifest": json.loads(row.input_manifest_json or "{}"),
+        "token_budget": row.token_budget,
+        "budget_used_tokens": row.budget_used_tokens,
+        "upstream_run_id": row.upstream_run_id,
     }
 
 
@@ -122,8 +141,19 @@ def create_schedule(
     feishu_notify: bool = False,
     feishu_notify_chat_id: str | None = None,
     model_id: str | None = None,
+    token_budget: int | None = None,
+    urls: list[str] | None = None,
+    workspace_paths: list[str] | None = None,
+    material_mode: str = "snapshot",
+    include_upstream_result: bool = False,
 ) -> Schedule:
-    chosen = selection_metadata(get_settings(), model_id) if model_id is not None else {}
+    settings = get_settings()
+    chosen = selection_metadata(settings, model_id)
+    skill, expert = resolve_creation_capabilities(prompt, skill_id, expert_id)
+    if token_budget is None:
+        token_budget = DEFAULT_SCHEDULE_TOKEN_BUDGET
+    if not isinstance(token_budget, int) or isinstance(token_budget, bool) or not 1024 <= token_budget <= 1000000:
+        raise AppError("BUDGET_REQUIRED", "自动化执行上限配置无效，请联系管理员。", status_code=422)
     mode = _normalize_trigger_mode(trigger_mode)
     if interval_minutes < 1:
         raise AppError("VALIDATION_ERROR", "间隔至少 1 分钟")
@@ -139,8 +169,9 @@ def create_schedule(
         prompt=prompt.strip(),
         model_id=chosen.get("model_id"),
         model_name=chosen.get("model_name"),
-        skill_id=skill_id or None,
-        expert_id=expert_id or None,
+        token_budget=token_budget,
+        skill_id=skill["id"] if skill else None,
+        expert_id=expert["id"] if expert else None,
         interval_minutes=interval_minutes,
         trigger_mode=mode,
         listen_schedule_id=listen_id,
@@ -151,6 +182,10 @@ def create_schedule(
         # 事件型不参与到期扫；仍写 next_run_at 占位，避免空值
         next_run_at=now + timedelta(minutes=interval_minutes),
     )
+    if include_upstream_result and mode != TRIGGER_ON_TASK_SUCCEEDED:
+        raise AppError("VALIDATION_ERROR", "只有上游成功触发的自动化可以读取上游报告")
+    config = configure_inputs(settings, row.id, urls=urls or [], workspace_paths=workspace_paths or [], material_mode=material_mode, include_upstream_result=include_upstream_result)
+    row.input_config_json = json.dumps(config, ensure_ascii=False)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -158,13 +193,37 @@ def create_schedule(
 
 
 def update_schedule(db: Session, schedule_id: str, **fields: Any) -> Schedule:
+    fields = {key: value for key, value in fields.items()
+              if value is not None or key not in {"urls", "workspace_paths", "material_mode", "include_upstream_result"}}
     row = get_schedule(db, schedule_id)
-    if "model_id" in fields:
+    if row.active_run_id:
+        raise AppError("SCHEDULE_BUSY", "自动化正在运行，请等待本次结束后再修改", status_code=409)
+    guarded = db.execute(update(Schedule).where(Schedule.id == schedule_id, Schedule.active_run_id.is_(None)).values(updated_at=utcnow()))
+    if guarded.rowcount != 1:
+        db.rollback()
+        raise AppError("SCHEDULE_BUSY", "自动化已开始运行，请等待本次结束", status_code=409)
+    if "token_budget" in fields:
+        budget = fields["token_budget"]
+        if budget is None:
+            budget = DEFAULT_SCHEDULE_TOKEN_BUDGET
+        if not isinstance(budget, int) or isinstance(budget, bool) or not 1024 <= budget <= 1000000:
+            raise AppError("BUDGET_REQUIRED", "自动化执行上限配置无效，请联系管理员。", status_code=422)
+        row.token_budget = budget
+    elif not row.token_budget:
+        row.token_budget = DEFAULT_SCHEDULE_TOKEN_BUDGET
+    if "model_id" in fields and fields["model_id"] is None:
+        raise AppError("MODEL_REQUIRED", "不能清空自动化使用的模型。", status_code=422)
+    if "model_id" in fields and (fields["model_id"] != row.model_id or not row.model_name):
         chosen = selection_metadata(get_settings(), fields["model_id"])
+        row.model_id, row.model_name = chosen["model_id"], chosen["model_name"]
+    elif "model_id" not in fields and not row.model_id:
+        chosen = selection_metadata(get_settings())
         row.model_id, row.model_name = chosen["model_id"], chosen["model_name"]
     if "name" in fields and fields["name"] is not None:
         row.name = str(fields["name"]).strip()[:200]
     if "prompt" in fields and fields["prompt"] is not None:
+        if not str(fields["prompt"]).strip():
+            raise AppError("VALIDATION_ERROR", "请填写任务内容")
         row.prompt = str(fields["prompt"]).strip()
     if "interval_minutes" in fields and fields["interval_minutes"] is not None:
         mins = int(fields["interval_minutes"])
@@ -177,6 +236,10 @@ def update_schedule(db: Session, schedule_id: str, **fields: Any) -> Schedule:
         row.skill_id = fields["skill_id"] or None
     if "expert_id" in fields:
         row.expert_id = fields["expert_id"] or None
+    if not row.skill_id and not row.expert_id and not any(key in fields for key in ("skill_id", "expert_id")):
+        skill, expert = resolve_creation_capabilities(row.prompt, None, None)
+        row.skill_id = skill["id"] if skill else None
+        row.expert_id = expert["id"] if expert else None
     if "feishu_notify" in fields and fields["feishu_notify"] is not None:
         row.feishu_notify = bool(fields["feishu_notify"])
     if "feishu_notify_chat_id" in fields:
@@ -197,6 +260,20 @@ def update_schedule(db: Session, schedule_id: str, **fields: Any) -> Schedule:
     row.trigger_mode = mode
     row.listen_schedule_id = listen_id
 
+    if any(key in fields for key in ("urls", "workspace_paths", "material_mode", "include_upstream_result")):
+        old = read_config(row)
+        use_upstream = fields.get("include_upstream_result", old.get("include_upstream_result", False))
+        if use_upstream and mode != TRIGGER_ON_TASK_SUCCEEDED:
+            raise AppError("VALIDATION_ERROR", "只有上游成功触发的自动化可以读取上游报告")
+        row.input_config_json = json.dumps(configure_inputs(
+            get_settings(), row.id, urls=fields.get("urls", old.get("urls", [])),
+            workspace_paths=fields.get("workspace_paths", [item["path"] for item in old.get("bindings", [])]),
+            material_mode=fields.get("material_mode", old.get("material_mode", "snapshot")),
+            include_upstream_result=use_upstream,
+        ), ensure_ascii=False)
+    elif mode != TRIGGER_ON_TASK_SUCCEEDED and read_config(row).get("include_upstream_result"):
+        raise AppError("VALIDATION_ERROR", "切换为定时时请同时关闭读取上游报告")
+
     row.updated_at = utcnow()
     db.commit()
     db.refresh(row)
@@ -205,6 +282,8 @@ def update_schedule(db: Session, schedule_id: str, **fields: Any) -> Schedule:
 
 def delete_schedule(db: Session, schedule_id: str) -> None:
     row = get_schedule(db, schedule_id)
+    if row.active_run_id:
+        raise AppError("SCHEDULE_BUSY", "自动化正在运行，请等待本次结束后再删除", status_code=409)
     # 其他自动化若监听本条：置空 listen，避免悬空
     dependents = list(
         db.scalars(
@@ -257,7 +336,7 @@ def _prune_runs(db: Session, schedule_id: str) -> None:
     rows = list(
         db.scalars(
             select(ScheduleRun)
-            .where(ScheduleRun.schedule_id == schedule_id)
+            .where(ScheduleRun.schedule_id == schedule_id, ScheduleRun.status != "running")
             .order_by(ScheduleRun.finished_at.desc(), ScheduleRun.id.desc())
         )
     )
@@ -313,6 +392,7 @@ def list_result_notices(
     stmt = (
         select(ScheduleRun, Schedule.name)
         .join(Schedule, Schedule.id == ScheduleRun.schedule_id)
+        .where(ScheduleRun.status != "running")
         .order_by(ScheduleRun.finished_at.desc(), ScheduleRun.id.desc())
     )
     if status:
@@ -322,7 +402,7 @@ def list_result_notices(
 
 
 async def dispatch_on_schedule_succeeded(
-    db: Session, source_schedule_id: str, *, chain_depth: int
+    db: Session, source_schedule_id: str, *, chain_depth: int, upstream_run_id: str | None = None
 ) -> int:
     """A 成功后触发监听它的 B；chain_depth 已计入本次将要触发的层级（≥1 不再继续链式）。"""
     if chain_depth > 1:
@@ -347,6 +427,7 @@ async def dispatch_on_schedule_succeeded(
                 listener.id,
                 trigger="task_done",
                 chain_depth=chain_depth,
+                upstream_run_id=upstream_run_id,
             )
             count += 1
         except Exception:
@@ -455,122 +536,128 @@ async def trigger_schedule(
     *,
     trigger: str = "manual",
     chain_depth: int = 0,
+    upstream_run_id: str | None = None,
+    due_before: datetime | None = None,
 ) -> Schedule:
-    """Create and run one research task for this schedule.
-
-    Align schedule last_* with the actual task outcome:
-    - always stamp last_run_at when a run was attempted
-    - on task failed (run_agent_job swallows AppError): keep last_task_id and set last_error
-    - on schedule-level AppError: set last_error; keep last_task_id if we already have one
-    - always append a schedule_runs row (then prune to schedule_run_keep)
-    - on success and chain_depth==0: dispatch on_task_succeeded listeners (A→B only)
-    """
+    """Claim and persist a run before any network call; only succeeded means success."""
     settings = get_settings()
     row = get_schedule(db, schedule_id)
-    task_id: str | None = None
+    if not row.model_id:
+        raise AppError("SCHEDULE_SETUP_REQUIRED", "请重新保存自动化设置后再运行", status_code=409)
+    token_budget = row.token_budget or DEFAULT_SCHEDULE_TOKEN_BUDGET
+    run_id, task_id = str(uuid.uuid4()), str(uuid.uuid4())
     started_at = utcnow()
-    task_succeeded = False
+    conditions = [Schedule.id == schedule_id, Schedule.active_run_id.is_(None)]
+    if due_before is not None:
+        conditions += [Schedule.enabled.is_(True), Schedule.trigger_mode == TRIGGER_INTERVAL,
+                       Schedule.next_run_at <= due_before]
+    claimed = db.execute(update(Schedule).where(*conditions).execution_options(synchronize_session=False).values(
+        active_run_id=run_id, last_run_at=started_at,
+        next_run_at=started_at + timedelta(minutes=row.interval_minutes),
+        updated_at=started_at, token_budget=token_budget,
+    ))
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise AppError("SCHEDULE_BUSY", "自动化已在执行或本次已被领取", status_code=409)
+    run_row = ScheduleRun(id=run_id, schedule_id=schedule_id, task_id=task_id,
+                          started_at=started_at, finished_at=started_at,
+                          status="running", trigger=trigger, token_budget=token_budget,
+                          budget_used_tokens=0, upstream_run_id=upstream_run_id)
+    db.add(run_row)
+    db.commit()
+    db.refresh(row)
+    config = read_config(row)
+    failure: Exception | None = None
+    cancelled = False
+    status, error = "failed", None
     try:
         task = await task_service.create_task(
-            db,
-            row.prompt,
-            [],
+            db, row.prompt, config.get("urls", []),
             settings=settings,
             skill_id=row.skill_id,
             expert_id=row.expert_id,
             source_schedule_id=row.id,
             model_id=row.model_id,
             model_name=row.model_name,
+            task_id=task_id,
+            defer_plan=True,
         )
-        task_id = task.id
+        meta = json.loads(task.plan_json)
+        meta.update(schedule_run_id=run_id, upstream_run_id=upstream_run_id)
+        task.plan_json = json.dumps(meta, ensure_ascii=False)
+        db.commit()
+        await attach_run_inputs(db, task, run_row, config, settings)
+        await task_service.generate_plan(db, task.id, settings=settings)
         await task_service.confirm_and_run(
             db, task.id, confirm_cost=True, settings=settings
         )
         task = task_service.get_task(db, task.id)
-        now = utcnow()
-        row.last_task_id = task.id
-        row.last_run_at = now
-        row.next_run_at = now + timedelta(minutes=row.interval_minutes)
-        row.updated_at = now
-        notify_status = "success"
-        notify_error: str | None = None
-        run_row: ScheduleRun | None = None
-        if task.status == "failed":
-            code = task.error_code or "RUN_FAILED"
-            msg = task.error_message or "任务执行失败"
-            err = f"{code}: {msg}"
-            row.last_error = err
-            run_row = _append_run(
-                db,
-                row.id,
-                task_id=task.id,
-                started_at=started_at,
-                finished_at=now,
-                status="failed",
-                error=err,
-                trigger=trigger,
-            )
-            notify_status = "failed"
-            notify_error = err
+        if task.status == "succeeded":
+            status = "success"
+            from app.services import reports
+            revision = reports.current(db, task)
+            manifest = json.loads(run_row.input_manifest_json or "{}")
+            manifest["result"] = {"version": revision.version, "sha256": hashlib.sha256(revision.markdown.encode("utf-8")).hexdigest()}
+            run_row.input_manifest_json = json.dumps(manifest, ensure_ascii=False)
+            db.commit()
         else:
-            row.last_error = None
-            run_row = _append_run(
-                db,
-                row.id,
-                task_id=task.id,
-                started_at=started_at,
-                finished_at=now,
-                status="success",
-                error=None,
-                trigger=trigger,
-            )
-            task_succeeded = task.status == "succeeded"
-            notify_status = "success"
-            notify_error = None
-        db.commit()
-        db.refresh(row)
-        await _maybe_feishu_after_run(
-            row=row,
-            status=notify_status,
-            error=notify_error,
-            task_id=task.id,
-            run=run_row,
-        )
+            status = "paused" if task.status == "paused" else "failed"
+            error = f"{task.error_code or 'RUN_' + status.upper()}: {task.error_message or '任务未完成'}"
+    except asyncio.CancelledError:
+        cancelled = True
+        status, error = "interrupted", "RUN_INTERRUPTED: 服务停止或执行被取消"
     except AppError as exc:
-        now = utcnow()
-        err = f"{exc.code}: {exc.message}"
-        row.last_error = err
-        row.last_run_at = now
-        row.next_run_at = now + timedelta(minutes=row.interval_minutes)
-        row.updated_at = now
-        if task_id:
-            row.last_task_id = task_id
-        run_row = _append_run(
-            db,
-            row.id,
-            task_id=task_id,
-            started_at=started_at,
-            finished_at=now,
-            status="failed",
-            error=err,
-            trigger=trigger,
-        )
-        db.commit()
-        db.refresh(row)
-        await _maybe_feishu_after_run(
-            row=row,
-            status="failed",
-            error=err,
-            task_id=task_id,
-            run=run_row,
-        )
-        raise
-
-    # 成功落库后再分发：仅 depth=0 的 A 可触发 B（depth≤1）
-    if task_succeeded and chain_depth == 0:
-        await dispatch_on_schedule_succeeded(db, row.id, chain_depth=1)
+        failure, error = exc, f"{exc.code}: {exc.message}"
+    except Exception:
+        failure = AppError("RUN_FAILED", "自动化执行异常，请查看任务记录后重试", status_code=500)
+        error = "RUN_FAILED: 自动化执行异常"
+    db.rollback()
+    now = utcnow()
+    run_row = db.get(ScheduleRun, run_id)
+    already_closed = run_row.status != "running"
+    if already_closed:
+        status, error = run_row.status, run_row.error
+    run_row.status, run_row.error, run_row.finished_at = status, error, now
+    actual_task = db.get(Task, task_id)
+    if actual_task is None:
+        run_row.task_id = None
+    elif not already_closed and status in {"failed", "interrupted"} and actual_task.status in {"draft", "planning", "running"}:
+        actual_task.status = "failed" if status == "failed" else "paused"
+        actual_task.operation_token = str(uuid.uuid4())
+        actual_task.error_code = error.split(":", 1)[0] if error else "RUN_FAILED"
+        actual_task.error_message = error
+    db.execute(update(Schedule).where(Schedule.id == schedule_id, Schedule.active_run_id == run_id).values(
+        active_run_id=None, last_task_id=run_row.task_id, last_error=error,
+        next_run_at=now + timedelta(minutes=row.interval_minutes), updated_at=now))
+    db.commit()
+    _prune_runs(db, schedule_id)
+    db.commit()
+    db.refresh(row)
+    if cancelled:
+        raise asyncio.CancelledError
+    await _maybe_feishu_after_run(row=row, status=status, error=error, task_id=run_row.task_id, run=run_row)
+    if failure:
+        raise failure
+    if status == "success" and chain_depth == 0:
+        await dispatch_on_schedule_succeeded(db, row.id, chain_depth=1, upstream_run_id=run_id)
         db.refresh(row)
     return row
+
+
+def recover_schedule_runs(db: Session) -> int:
+    """Called only while holding the exclusive service lock."""
+    interrupted = list(db.scalars(select(ScheduleRun).where(ScheduleRun.status == "running")))
+    for run in interrupted:
+        run.status, run.finished_at = "interrupted", utcnow()
+        run.error = "RUN_INTERRUPTED: 上次服务退出，未确认完成；请检查任务后手动重跑"
+        row = db.get(Schedule, run.schedule_id)
+        if row:
+            row.last_error = run.error
+            row.next_run_at = utcnow() + timedelta(minutes=row.interval_minutes)
+    db.execute(update(Schedule).where(Schedule.active_run_id.is_not(None)).values(active_run_id=None))
+    db.execute(update(ModelCall).where(ModelCall.status == "pending").values(status="interrupted", error_code="RUN_INTERRUPTED"))
+    db.commit()
+    return len(interrupted)
 
 
 async def tick_due_schedules(db: Session) -> int:
@@ -582,6 +669,7 @@ async def tick_due_schedules(db: Session) -> int:
                 Schedule.enabled.is_(True),
                 Schedule.next_run_at <= now,
                 Schedule.trigger_mode == TRIGGER_INTERVAL,
+                Schedule.model_id.is_not(None),
             )
         )
     )
@@ -589,7 +677,7 @@ async def tick_due_schedules(db: Session) -> int:
     count = 0
     for row in due:
         try:
-            await trigger_schedule(db, row.id, trigger="interval", chain_depth=0)
+            await trigger_schedule(db, row.id, trigger="interval", chain_depth=0, due_before=now)
             count += 1
         except Exception:
             # error already recorded on row when AppError; swallow to keep loop alive

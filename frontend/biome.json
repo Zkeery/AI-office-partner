@@ -1,0 +1,24 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "files": { "includes": ["app/**", "components/**", "lib/**", "tests/**"] },
+  "css": { "parser": { "tailwindDirectives": true } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noUnreachable": "error",
+        "noUnusedImports": "warn",
+        "useHookAtTopLevel": "error",
+        "useExhaustiveDependencies": "warn",
+        "useJsxKeyInIterable": "error"
+      },
+      "security": { "noGlobalEval": "error" },
+      "suspicious": {
+        "noDuplicateObjectKeys": "error",
+        "noDuplicateParameters": "error",
+        "noDuplicateJsxProps": "error"
+      }
+    }
+  }
+}

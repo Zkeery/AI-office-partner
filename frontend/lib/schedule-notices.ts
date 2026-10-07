@@ -1,6 +1,7 @@
 /** 自动化站内结果通知：localStorage 已读水位（刷新后仍可知未读失败）。 */
 
-import type { ScheduleNotice } from "./api";
+import { userErrorMessage, type ScheduleNotice } from "./api";
+import { runStatusLabel } from "./composer-materials";
 
 const ACK_KEY = "ai_office_sched_acked_runs";
 const ACK_CAP = 200;
@@ -49,8 +50,8 @@ export function unreadFailures(notices: ScheduleNotice[], acked?: Set<string>): 
 export function formatNoticeLine(n: ScheduleNotice): string {
   const name = n.schedule_name || "自动化";
   if (n.status === "failed") {
-    const brief = (n.error || "执行失败").replace(/\s+/g, " ").slice(0, 80);
+    const brief = userErrorMessage(n.error || "执行失败").replace(/\s+/g, " ").slice(0, 80);
     return `「${name}」失败：${brief}`;
   }
-  return `「${name}」已跑完`;
+  return `「${name}」${runStatusLabel(n.status)}`;
 }

@@ -76,7 +76,7 @@ export default function DesignLab() {
   const [sidebar, setSidebar] = useState(false);
   const [references, setReferences] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
-  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const composer = useRef<HTMLTextAreaElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const selected = directions.find(d => d.id === theme)!;

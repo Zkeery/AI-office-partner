@@ -119,6 +119,16 @@ def detect_scene(prompt: str) -> dict[str, Any]:
     }
 
 
+def resolve_creation_capabilities(
+    prompt: str, skill_id: str | None, expert_id: str | None
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Infer new-work capabilities only when the caller supplied neither choice."""
+    if skill_id is None and expert_id is None:
+        scene = detect_scene(prompt)
+        skill_id, expert_id = scene.get("skill_id"), scene.get("expert_id")
+    return resolve_skill_and_expert(skill_id, expert_id)
+
+
 def public_scene(scene: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": scene["id"],

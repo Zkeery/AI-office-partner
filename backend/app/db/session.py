@@ -27,6 +27,9 @@ def _ensure_schedule_columns() -> None:
         for name, kind in (("model_id", "VARCHAR(80)"), ("model_name", "VARCHAR(200)")):
             if name not in cols:
                 conn.execute(text(f"ALTER TABLE schedules ADD COLUMN {name} {kind}"))
+        for name, kind in (("input_config_json", "TEXT NOT NULL DEFAULT '{}'"), ("token_budget", "INTEGER"), ("active_run_id", "VARCHAR(36)")):
+            if name not in cols:
+                conn.execute(text(f"ALTER TABLE schedules ADD COLUMN {name} {kind}"))
         if "trigger_mode" not in cols:
             conn.execute(
                 text(
@@ -60,6 +63,14 @@ def _ensure_schedule_columns() -> None:
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_schedule_columns()
+    with engine.begin() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(tasks)"))}
+        if "operation_token" not in cols:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN operation_token VARCHAR(36) NOT NULL DEFAULT ''"))
+        run_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(schedule_runs)"))}
+        for name, kind in (("input_manifest_json", "TEXT NOT NULL DEFAULT '{}'"), ("token_budget", "INTEGER"), ("budget_used_tokens", "INTEGER NOT NULL DEFAULT 0"), ("upstream_run_id", "VARCHAR(36)")):
+            if name not in run_cols:
+                conn.execute(text(f"ALTER TABLE schedule_runs ADD COLUMN {name} {kind}"))
 
 
 def get_db() -> Generator[Session, None, None]:

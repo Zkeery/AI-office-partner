@@ -186,10 +186,12 @@ export function ReportWorkbench({
     return doc;
   }, [taskId]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A changed parent report invalidates the document endpoint even when taskId is unchanged.
   useEffect(() => {
     reload().catch((failure: Error) => { if (mounted.current) setError(failure.message); });
   }, [reload, report]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: A new report version must refresh the available version list.
   useEffect(() => {
     if (!openHistory) return;
     let active = true;
@@ -201,6 +203,7 @@ export function ReportWorkbench({
     return () => { active = false; };
   }, [openHistory, taskId, document?.version]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Diff output depends on the latest report version as well as the selected historical version.
   useEffect(() => {
     if (!openHistory || previewNumber === null) return;
     let active = true;

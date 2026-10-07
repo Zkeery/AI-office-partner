@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { listModels, type ModelOption } from "@/lib/api";
 import s from "./model-picker.module.css";
 
@@ -25,14 +25,14 @@ export function ModelPicker({ value, onChange, disabled = false, variant = "defa
   const selectedTag = selected ? modelTags[selected.model] : undefined;
   const selectedLabel = selected?.model === "gpt-4.1-mini" ? "GPT-4.1" : selected?.label;
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setLoading(true);
     setError(false);
     try { setModels((await listModels()).filter(model => model.available)); }
     catch { setError(true); }
     finally { setLoading(false); }
-  }
-  useEffect(() => { void refresh(); }, []);
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
     if (!open) return;
     function outside(e: PointerEvent) { if (!root.current?.contains(e.target as Node)) setOpen(false); }

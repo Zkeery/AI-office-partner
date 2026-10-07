@@ -1,6 +1,7 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8040";
 
 export type Task = {
+  usage?: { calls: number; total_tokens: number; unknown_calls: number; simulated_calls: number; estimated_cost_cny: number };
   id: string;
   title: string;
   user_prompt: string;
@@ -60,9 +61,20 @@ export async function listModels(): Promise<ModelOption[]> {
 function networkHint(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err || "");
   if (/Failed to fetch|NetworkError|Load failed|ECONNREFUSED/i.test(msg)) {
-    return "连不上后端 8040。请先启动：cd backend && source .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8040 --reload";
+    return "暂时连接不上服务，请稍后重试。";
   }
   return msg || "请求失败";
+}
+
+export class ApiError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export function userErrorMessage(message: string): string {
+  return message.replace(/^[A-Z][A-Z0-9_]{2,}:\s*/, "");
 }
 
 async function parse<T>(res: Response): Promise<T> {
@@ -73,13 +85,13 @@ async function parse<T>(res: Response): Promise<T> {
     throw new Error(
       res.ok
         ? networkHint(e)
-        : `请求失败（HTTP ${res.status}）。请确认后端 8040 已启动并重试。`
+        : "服务暂时无法处理请求，请稍后重试。"
     );
   }
   if (!res.ok) {
     const msg = data?.error?.message || "请求失败";
     const code = data?.error?.code || "ERROR";
-    throw new Error(`${code}: ${msg}`);
+    throw new ApiError(code, msg);
   }
   return data as T;
 }
@@ -111,7 +123,7 @@ export async function listTasks(opts?: {
 export async function createTask(
   prompt: string,
   urls: string[],
-  opts: { model_id: string; skill_id?: string; expert_id?: string }
+  opts?: { model_id?: string; skill_id?: string; expert_id?: string }
 ): Promise<Task> {
   const res = await apiFetch(`${API_BASE}/api/tasks`, {
     method: "POST",
@@ -119,9 +131,9 @@ export async function createTask(
     body: JSON.stringify({
       prompt,
       urls,
-      model_id: opts.model_id,
-      skill_id: opts?.skill_id || null,
-      expert_id: opts?.expert_id || null,
+      ...(opts?.model_id ? { model_id: opts.model_id } : {}),
+      ...(opts?.skill_id ? { skill_id: opts.skill_id } : {}),
+      ...(opts?.expert_id ? { expert_id: opts.expert_id } : {}),
     }),
   });
   return parse<Task>(res);
@@ -489,7 +501,17 @@ export async function detectScene(prompt: string): Promise<SceneDetect> {
   return parse<SceneDetect>(res);
 }
 
-export type Schedule = {
+export type ScheduleInputs = {
+  token_budget: number;
+  urls: string[];
+  workspace_paths: string[];
+  material_mode: "snapshot" | "latest";
+  include_upstream_result: boolean;
+};
+
+export type Schedule = Partial<ScheduleInputs> & {
+  setup_required?: boolean;
+  active_run_id?: string | null;
   id: string;
   name: string;
   prompt: string;
@@ -539,10 +561,10 @@ export async function listSchedules(): Promise<Schedule[]> {
   return data.items;
 }
 
-export async function createSchedule(body: {
+export async function createSchedule(body: Partial<ScheduleInputs> & {
   name: string;
   prompt: string;
-  model_id: string;
+  model_id?: string;
   interval_minutes: number;
   skill_id?: string;
   expert_id?: string;
@@ -562,11 +584,13 @@ export async function createSchedule(body: {
 
 export async function patchSchedule(
   id: string,
-  body: Partial<{
+  body: Partial<ScheduleInputs & {
     enabled: boolean;
     model_id: string;
     name: string;
     prompt: string;
+    skill_id: string | null;
+    expert_id: string | null;
     interval_minutes: number;
     trigger_mode: "interval" | "on_task_succeeded";
     listen_schedule_id: string | null;
@@ -593,6 +617,10 @@ export async function runScheduleNow(id: string): Promise<Schedule> {
 }
 
 export type ScheduleRun = {
+  token_budget?: number;
+  budget_used_tokens?: number;
+  usage?: { total_tokens: number; unknown_calls: number; simulated_calls: number; calls: number };
+  input_manifest?: { files?: { filename: string; sha256: string }[]; upstream?: { run_id: string; version: number } };
   id: string;
   schedule_id: string;
   task_id?: string | null;

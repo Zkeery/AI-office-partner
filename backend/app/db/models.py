@@ -21,6 +21,7 @@ class Task(Base):
     title: Mapped[str] = mapped_column(String(200), default="")
     user_prompt: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="draft", index=True)
+    operation_token: Mapped[str] = mapped_column(String(36), default="")
     cost_estimate_cny: Mapped[float] = mapped_column(Float, default=0.0)
     cost_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     plan_json: Mapped[str] = mapped_column(Text, default="{}")
@@ -44,6 +45,7 @@ class Task(Base):
     report_versions: Mapped[list[ReportVersion]] = relationship(
         back_populates="task", cascade="all, delete-orphan"
     )
+    model_calls: Mapped[list[ModelCall]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
 
 class ReportVersion(Base):
@@ -114,6 +116,9 @@ class Schedule(Base):
     prompt: Mapped[str] = mapped_column(Text)
     model_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    input_config_json: Mapped[str] = mapped_column(Text, default="{}")
+    token_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    active_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     skill_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     expert_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
@@ -150,8 +155,33 @@ class ScheduleRun(Base):
     status: Mapped[str] = mapped_column(String(40), default="success")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     trigger: Mapped[str] = mapped_column(String(40), default="manual")
+    input_manifest_json: Mapped[str] = mapped_column(Text, default="{}")
+    token_budget: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    budget_used_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    upstream_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     schedule: Mapped[Schedule] = relationship(back_populates="runs")
+
+
+class ModelCall(Base):
+    __tablename__ = "model_calls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    schedule_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    phase: Mapped[str] = mapped_column(String(40))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    reserved_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_source: Mapped[str] = mapped_column(String(40), default="unknown")
+    estimated_cost_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    task: Mapped[Task] = relationship(back_populates="model_calls")
 
 
 def make_engine(db_url: str):

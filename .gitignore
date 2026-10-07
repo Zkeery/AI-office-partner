@@ -28,6 +28,10 @@ dist/
 data/
 backend/data/
 .runtime/
+backups/
+frontend/.next-e2e/
+frontend/playwright-report/
+frontend/test-results/
 logs/
 *.log
 

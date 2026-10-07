@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -7,11 +8,17 @@ import httpx
 
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.services.usage import finish_attempt, reserve_attempt
 
 
 async def chat_completion(settings: Settings, system: str, user: str) -> str:
     if settings.llm_mock:
-        return _mock_reply(system, user)
+        call = reserve_attempt(settings, system, user, 1)
+        reply = _mock_reply(system, user)
+        prompt_tokens = (len((system + user).encode("utf-8")) + 3) // 4
+        completion_tokens = (len(reply.encode("utf-8")) + 3) // 4
+        finish_attempt(call, status="mock", settings=settings, simulated=True, usage={"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens})
+        return reply
     if not settings.llm_api_key:
         raise AppError("MODEL_NOT_CONFIGURED", "模型未配置，无法执行任务", status_code=422)
 
@@ -23,16 +30,66 @@ async def chat_completion(settings: Settings, system: str, user: str) -> str:
     payload = {
         "model": settings.llm_model,
         "temperature": 0.2,
+        "max_tokens": max(1, min(settings.llm_max_output_tokens, 16384)),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     }
+    attempts = max(1, min(settings.llm_max_attempts, 3))
     async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    return data["choices"][0]["message"]["content"]
+        for attempt in range(1, attempts + 1):
+            call = reserve_attempt(settings, system, user, attempt)
+            usage = None
+            retry = False
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code >= 400:
+                    try:
+                        error = resp.json().get("error", {})
+                        quota = isinstance(error, dict) and error.get("code") in {"insufficient_quota", "insufficient_balance", "quota_exceeded"}
+                    except (ValueError, AttributeError):
+                        quota = False
+                    if resp.status_code in {401, 403}:
+                        raise AppError("LLM_AUTH_FAILED", "模型鉴权失败，请检查服务端密钥及权限", status_code=502)
+                    if resp.status_code == 402 or quota:
+                        raise AppError("LLM_QUOTA_EXCEEDED", "模型账户额度不足，请补充额度后重试", status_code=502)
+                    if resp.status_code == 429:
+                        retry = True
+                        raise AppError("LLM_RATE_LIMITED", "模型请求被限流，有限重试后仍未恢复，请稍后继续", status_code=503)
+                    if resp.status_code >= 500 or resp.status_code == 408:
+                        retry = True
+                        raise AppError("LLM_UNAVAILABLE", "模型服务暂时不可用，有限重试后仍未恢复", status_code=503)
+                    raise AppError("LLM_REQUEST_REJECTED", "模型拒绝了请求，请检查型号、材料长度和模型参数", status_code=502)
+                data = resp.json()
+                usage = data.get("usage")
+                choice = data["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    raise AppError("LLM_OUTPUT_TRUNCATED", "模型输出达到长度上限，未将不完整内容作为成品；请缩小任务或章节后重试", status_code=502)
+                content = choice["message"]["content"]
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("empty content")
+            except asyncio.CancelledError:
+                finish_attempt(call, status="interrupted", settings=settings, usage=usage, error_code="LLM_INTERRUPTED")
+                raise
+            except httpx.TimeoutException:
+                retry = True
+                error = AppError("LLM_TIMEOUT", "模型请求超时，有限重试后仍未恢复，请稍后继续", status_code=504)
+            except httpx.RequestError:
+                retry = True
+                error = AppError("LLM_NETWORK_ERROR", "无法连接模型服务，请检查网络后继续", status_code=503)
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+                error = AppError("LLM_INVALID_RESPONSE", "模型返回格式无效或正文为空，请重试", status_code=502)
+            except AppError as exc:
+                error = exc
+            else:
+                finish_attempt(call, status="success", settings=settings, usage=usage)
+                return content
+            finish_attempt(call, status="failed", settings=settings, usage=usage, error_code=error.code)
+            if not retry or attempt == attempts:
+                raise error
+            await asyncio.sleep(max(0, min(settings.llm_retry_base_seconds, 5)) * 2 ** (attempt - 1))
+    raise AppError("LLM_UNAVAILABLE", "模型服务暂时不可用", status_code=503)
 
 
 def _mock_reply(system: str, user: str) -> str:

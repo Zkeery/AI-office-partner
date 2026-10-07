@@ -152,16 +152,26 @@ def upload_table_file(
     target_dir = safe_resolve(root, rel_dir) if rel_dir else root
     if not target_dir.exists() or not target_dir.is_dir():
         raise AppError("WORKSPACE_INVALID", "目标文件夹不存在")
-    dest = target_dir / name
-    if dest.exists():
-        stem = dest.stem
-        dest = target_dir / f"{stem}_new{ext}"
-    dest.write_bytes(data)
+    # Exclusive creation protects both repeated names and concurrent uploads.
+    stem = Path(name).stem
+    index = 0
+    while True:
+        suffix = "" if index == 0 else ("_new" if index == 1 else f"_new{index}")
+        dest = target_dir / f"{stem}{suffix}{ext}"
+        try:
+            with dest.open("xb") as stream:
+                stream.write(data)
+            break
+        except FileExistsError:
+            index += 1
     rel = str(dest.relative_to(root)).replace("\\", "/")
     return {"name": dest.name, "rel": rel, "size": len(data), "is_dir": False}
 
 
-def collect_workspace_excerpts(settings: Settings | None = None, limit_files: int = 8, max_chars: int = 8000) -> str:
+def collect_workspace_excerpts(settings: Settings | None = None, limit_files: int = 8, max_chars: int = 8000, *, paths: list[str] | None = None) -> str:
+    """Legacy explicit selection only. An authorized root never implies task consent."""
+    if not paths:
+        return ""
     try:
         root = require_root(settings)
     except AppError:
@@ -169,7 +179,8 @@ def collect_workspace_excerpts(settings: Settings | None = None, limit_files: in
     chunks: list[str] = []
     total = 0
     count = 0
-    for path in sorted(root.rglob("*")):
+    for rel in paths:
+        path = safe_resolve(root, rel)
         if count >= limit_files:
             break
         if not path.is_file() or path.is_symlink():

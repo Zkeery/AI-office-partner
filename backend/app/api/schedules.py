@@ -17,7 +17,12 @@ TriggerMode = Literal["interval", "on_task_succeeded"]
 class ScheduleCreate(BaseModel):
     name: str = "自动化"
     prompt: str = Field(min_length=1, max_length=8000)
-    model_id: str = Field(min_length=1, max_length=80)
+    model_id: str | None = Field(default=None, min_length=1, max_length=80)
+    token_budget: int | None = Field(default=None, ge=1024, le=1000000)
+    urls: list[str] = Field(default_factory=list, max_length=3)
+    workspace_paths: list[str] = Field(default_factory=list, max_length=3)
+    material_mode: Literal["snapshot", "latest"] = "snapshot"
+    include_upstream_result: bool = False
     interval_minutes: int = Field(default=60, ge=1, le=10080)
     skill_id: str | None = None
     expert_id: str | None = None
@@ -29,6 +34,11 @@ class ScheduleCreate(BaseModel):
 
 
 class SchedulePatch(BaseModel):
+    token_budget: int | None = Field(default=None, ge=1024, le=1000000)
+    urls: list[str] | None = Field(default=None, max_length=3)
+    workspace_paths: list[str] | None = Field(default=None, max_length=3)
+    material_mode: Literal["snapshot", "latest"] | None = None
+    include_upstream_result: bool | None = None
     model_id: str | None = Field(default=None, min_length=1, max_length=80)
     name: str | None = None
     prompt: str | None = None
@@ -55,6 +65,11 @@ def create_schedule(body: ScheduleCreate, db: Session = Depends(get_db)) -> dict
         name=body.name,
         prompt=body.prompt,
         model_id=body.model_id,
+        token_budget=body.token_budget,
+        urls=body.urls,
+        workspace_paths=body.workspace_paths,
+        material_mode=body.material_mode,
+        include_upstream_result=body.include_upstream_result,
         interval_minutes=body.interval_minutes,
         skill_id=body.skill_id,
         expert_id=body.expert_id,
@@ -106,7 +121,7 @@ def list_schedule_runs(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     items = [
-        schedule_service.serialize_run(r)
+        {**schedule_service.serialize_run(r), "usage": schedule_service.run_usage(db, r.id)}
         for r in schedule_service.list_schedule_runs(db, schedule_id, limit=limit)
     ]
     return {"items": items, "limit": limit}

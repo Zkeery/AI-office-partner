@@ -1,19 +1,17 @@
 "use client";
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  Expert,
   Schedule,
   ScheduleNotice,
   ScheduleRun,
   Scene,
   SceneDetect,
-  Skill,
   Task,
+  ApiError,
   attachWorkspaceRefs,
   confirmTask,
-  createSchedule,
   createTask,
   deleteSchedule,
   deleteTask,
@@ -28,12 +26,10 @@ import {
   getReport,
   getTask,
   getWorkspace,
-  listExperts,
   listScenes,
   listScheduleNotices,
   listScheduleRuns,
   listSchedules,
-  listSkills,
   listTasks,
   listWorkspaceEntries,
   mergeTasks,
@@ -49,11 +45,13 @@ import {
   unarchiveTask,
   uploadFile,
   uploadWorkspaceTable,
+  userErrorMessage,
 } from "@/lib/api";
 import { exportLabel, type ExportKind } from "@/lib/export-prefs";
 import { linkifyReport } from "@/lib/linkify-report";
 import { ReportWorkbench } from "@/components/ReportWorkbench";
-import { ModelPicker } from "@/components/ModelPicker";
+import { ScheduleEditor } from "@/components/ScheduleEditor";
+import { composerSkill, hasTableMaterial, runStatusLabel } from "@/lib/composer-materials";
 import { FusionHome, FusionShell, type WorkspacePanel } from "@/components/FusionWorkspace";
 import {
   ackRunIds,
@@ -255,15 +253,22 @@ export default function HomePage() {
   const [prompt, setPrompt] = useState("");
   const [urls, setUrls] = useState("");
   const [report, setReport] = useState("");
-  const [error, setError] = useState("");
+  const [error, setErrorValue] = useState("");
+  const [errorCode, setErrorCode] = useState("");
+  const setError = useCallback((message: string) => {
+    setErrorValue(message);
+    setErrorCode("");
+  }, []);
+  const setRequestError = useCallback((cause: unknown) => {
+    setErrorValue(cause instanceof Error ? cause.message : String(cause));
+    setErrorCode(cause instanceof ApiError ? cause.code : "");
+  }, []);
   const [busy, setBusy] = useState(false);
   const [wsRoot, setWsRoot] = useState("");
   const [wsEntries, setWsEntries] = useState<WorkspaceEntry[]>([]);
   const [wsPreview, setWsPreview] = useState("");
   const [wsFilter, setWsFilter] = useState<"tables" | "all">("tables");
   const [wsSearch, setWsSearch] = useState("");
-  const [skills, setSkills] = useState<Skill[]>([]);
-  const [experts, setExperts] = useState<Expert[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [activeSceneId, setActiveSceneId] = useState("");
   const [pinnedSceneCategory, setPinnedSceneCategory] = useState("writing");
@@ -276,9 +281,7 @@ export default function HomePage() {
   });
   const [detectHint, setDetectHint] = useState<SceneDetect | null>(null);
   const [skillId, setSkillId] = useState("");
-  const [modelId, setModelId] = useState("");
-  const [expertId, setExpertId] = useState("");
-  const [shelfLocked, setShelfLocked] = useState(false);
+  const [sceneLocked, setSceneLocked] = useState(false);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [expandedRunScheduleId, setExpandedRunScheduleId] = useState<string | null>(null);
   const [scheduleRuns, setScheduleRuns] = useState<ScheduleRun[]>([]);
@@ -287,25 +290,14 @@ export default function HomePage() {
   const [ackedRunIds, setAckedRunIds] = useState<Set<string>>(() => new Set());
   const [schedToast, setSchedToast] = useState<ScheduleNotice | null>(null);
   const schedToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [schedName, setSchedName] = useState("自动化周报");
-  const [schedPrompt, setSchedPrompt] = useState("");
-  const [schedInterval, setSchedInterval] = useState(60);
-  const [schedTriggerMode, setSchedTriggerMode] = useState<"interval" | "on_task_succeeded">("interval");
-  const [schedListenId, setSchedListenId] = useState("");
-  const [schedSkillId, setSchedSkillId] = useState("");
-  const [schedModelId, setSchedModelId] = useState("");
-  const [schedExpertId, setSchedExpertId] = useState("");
+  const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
+  const materialScene = useRef(false);
   const [showMore, setShowMore] = useState(false);
   const [showSchedForm, setShowSchedForm] = useState(false);
   const [needsTableUpload, setNeedsTableUpload] = useState(false);
   const [pendingTableFiles, setPendingTableFiles] = useState<File[]>([]);
   const [pendingWsTables, setPendingWsTables] = useState<string[]>([]);
   const [wsRel, setWsRel] = useState("");
-  const [shelfTab, setShelfTab] = useState<"experts" | "skills">("experts");
-  const [shelfQuery, setShelfQuery] = useState("");
-  const [showShelf, setShowShelf] = useState(false);
-  const [shelfDraftExpertId, setShelfDraftExpertId] = useState("");
-  const [shelfDraftSkillId, setShelfDraftSkillId] = useState("");
   const [taskRailOpen, setTaskRailOpen] = useState(true);
   const [taskQuery, setTaskQuery] = useState("");
   const [taskQueryDraft, setTaskQueryDraft] = useState("");
@@ -517,6 +509,7 @@ export default function HomePage() {
     }
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Hydrate URL and initial lists once; refresh callbacks are recreated on render.
   useEffect(() => {
     const initial = new URLSearchParams(window.location.search);
     const taskId = initial.get("task");
@@ -533,12 +526,6 @@ export default function HomePage() {
       /* ignore */
     }
     refreshScheduleNotices({ toastNewestUnreadFail: true }).catch(() => undefined);
-    Promise.all([listSkills(), listExperts()])
-      .then(([s, e]) => {
-        setSkills(s);
-        setExperts(e);
-      })
-      .catch(() => undefined);
     listScenes()
       .then((sc) => setScenes(sc))
       .catch(() => undefined);
@@ -561,6 +548,7 @@ export default function HomePage() {
     return () => mobile.removeEventListener("change", collapseOnMobile);
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: This interval reads notices and persisted acknowledgement IDs, not a render snapshot.
   useEffect(() => {
     const tick = () => {
       refreshScheduleNotices().catch(() => undefined);
@@ -589,7 +577,6 @@ export default function HomePage() {
   }
 
   function startNewCompose() {
-    setModelId("");
     setTaskQueryDraft("");
     setTaskQuery("");
     setTaskBackTo(null);
@@ -601,12 +588,10 @@ export default function HomePage() {
     setActiveSceneId("");
     setDetectHint(null);
     setSkillId("");
-    setExpertId("");
-    setShelfLocked(false);
+    setSceneLocked(false);
     setNeedsTableUpload(false);
     clearTableSelection();
     setShowMore(false);
-    setShowShelf(false);
     setError("");
     setFeishuExport(null);
     setFeishuChooserOpen(false);
@@ -701,6 +686,7 @@ export default function HomePage() {
     return () => window.clearTimeout(timer);
   }, [taskQueryDraft]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Query changes trigger refresh, which reads taskQuery; selecting a task must not retrigger list loading.
   useEffect(() => {
     if (!routeReady) return;
     refresh(selected?.id).catch((e) => setError(String(e.message || e)));
@@ -725,29 +711,29 @@ export default function HomePage() {
       setDetectHint(null);
       return;
     }
+    let active = true;
     const timer = setTimeout(() => {
       detectScene(text)
         .then((d) => {
+          if (!active) return;
           if (!(d.scene_id && d.confidence >= 0.5)) {
             setDetectHint(null);
             return;
           }
           setDetectHint(d);
-          // Free-typing: keep skill/expert in sync with latest detect.
-          // Shelf picks stay until user clears them.
-          if (!shelfLocked) {
+          // Keep a selected business scene until the user changes the request.
+          if (!sceneLocked) {
             setSkillId(d.skill_id || "");
-            setExpertId(d.expert_id || "");
             setActiveSceneId(d.scene_id || "");
             setNeedsTableUpload(Boolean(d.needs_table_upload));
             const matched = scenes.find((s) => s.id === d.scene_id);
             if (matched?.category) setPinnedSceneCategory(matched.category);
           }
         })
-        .catch(() => setDetectHint(null));
+        .catch(() => { if (active) setDetectHint(null); });
     }, 350);
-    return () => clearTimeout(timer);
-  }, [prompt, scenes, shelfLocked]);
+    return () => { active = false; clearTimeout(timer); };
+  }, [prompt, scenes, sceneLocked]);
 
   async function selectTask(id: string, opts?: { backTo?: Panel }) {
     if (window.matchMedia("(max-width: 767px)").matches) setTaskRailOpen(false);
@@ -862,7 +848,6 @@ export default function HomePage() {
   async function onCreate() {
     if (busy) return;
     if (!prompt.trim()) { setError("请先描述你要完成的任务。"); return; }
-    if (!modelId) { setError("请先选择本次任务使用的模型。"); return; }
     setBusy(true);
     setError("");
     try {
@@ -871,22 +856,17 @@ export default function HomePage() {
         .map((s) => s.trim())
         .filter(Boolean)
         .slice(0, 3);
-      const effectiveSkill = skillId || detectHint?.skill_id || undefined;
-      const effectiveExpert = expertId || detectHint?.expert_id || undefined;
+      const effectiveSkill = composerSkill(pendingTableFiles, pendingWsTables, skillId, detectHint?.skill_id || undefined);
       const wantTable =
         needsTableUpload ||
         effectiveSkill === "table_analysis" ||
         Boolean(detectHint?.needs_table_upload);
-      if (wantTable && pendingTableFiles.length === 0 && pendingWsTables.length === 0) {
+      if (wantTable && !hasTableMaterial(pendingTableFiles, pendingWsTables)) {
         setError("表格分析请先上传 CSV/Excel，或从资料库选一张表。");
         setBusy(false);
         return;
       }
-      const t = await createTask(prompt, urlList, {
-        model_id: modelId,
-        skill_id: effectiveSkill,
-        expert_id: effectiveExpert,
-      });
+      const t = await createTask(prompt, urlList);
       for (const file of pendingTableFiles.slice(0, 3)) {
         await uploadFile(t.id, file);
       }
@@ -903,10 +883,8 @@ export default function HomePage() {
       setPendingTableFiles([]);
       setPendingWsTables([]);
       setNeedsTableUpload(false);
-      setModelId("");
       setSkillId("");
-      setExpertId("");
-      setShelfLocked(false);
+      setSceneLocked(false);
       setTaskBackTo(null);
       setPanel("task");
       await refresh(t.id);
@@ -915,8 +893,7 @@ export default function HomePage() {
         await confirmTask(t.id, false);
         await refresh(t.id);
       } catch (e: any) {
-        const msg = e.message || String(e);
-        setError(msg);
+        setRequestError(e);
         await refresh(t.id);
       }
     } catch (e: any) {
@@ -932,14 +909,14 @@ export default function HomePage() {
   }
 
   async function applyScene(scene: Scene) {
+    materialScene.current = false;
     setActiveSceneId(scene.id);
     setPinnedSceneCategory(scene.category || "writing");
     setPrompt(scene.prompt_template);
     setSkillId(scene.skill_id || "");
-    setExpertId(scene.expert_id || "");
     setNeedsTableUpload(Boolean(scene.needs_table_upload));
     setDetectHint(null);
-    setShelfLocked(true);
+    setSceneLocked(true);
   }
 
   function pickTableForAnalysis(rel: string) {
@@ -953,7 +930,18 @@ export default function HomePage() {
     }
     setPendingWsTables((prev) => (prev.includes(rel) ? prev : [...prev, rel].slice(0, 3)));
     setPendingTableFiles([]);
+    materialScene.current = true;
     setPanel("compose");
+  }
+
+  function removeWorkspaceMaterial(path: string) {
+    const next = pendingWsTables.filter(item => item !== path);
+    setPendingWsTables(next);
+    if (materialScene.current && !hasTableMaterial(pendingTableFiles, next)) {
+      materialScene.current = false;
+      setSkillId(""); setNeedsTableUpload(false);
+      setActiveSceneId(""); setDetectHint(null); setSceneLocked(false);
+    }
   }
 
   async function onWorkspaceUpload(file: File | null) {
@@ -982,7 +970,7 @@ export default function HomePage() {
       await confirmTask(selected.id, confirmCost);
       await refresh(selected.id);
     } catch (e: any) {
-      setError(e.message || String(e));
+      setRequestError(e);
     } finally {
       setBusy(false);
     }
@@ -1118,47 +1106,9 @@ export default function HomePage() {
     }
   }
 
-  async function onCreateSchedule() {
-    if (!schedPrompt.trim()) return;
-    if (!schedModelId) { setError("请先选择自动化使用的模型。"); return; }
-    if (schedTriggerMode === "on_task_succeeded" && !schedListenId) {
-      setError("请选择要监听的自动化（某条成功后再跑本条）");
-      return;
-    }
-    setBusy(true);
-    setError("");
-    try {
-      await createSchedule({
-        model_id: schedModelId,
-        name: schedName.trim() || "自动化",
-        prompt: schedPrompt.trim(),
-        interval_minutes: Math.max(1, Number(schedInterval) || 60),
-        skill_id: schedSkillId || undefined,
-        expert_id: schedExpertId || undefined,
-        trigger_mode: schedTriggerMode,
-        listen_schedule_id:
-          schedTriggerMode === "on_task_succeeded" ? schedListenId || undefined : undefined,
-      });
-      setSchedPrompt("");
-      setSchedName("自动化周报");
-      setSchedInterval(60);
-      setSchedTriggerMode("interval");
-      setSchedListenId("");
-      setShowSchedForm(false);
-      await refreshSchedules();
-    } catch (e: any) {
-      setError(e.message || String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  function openSchedForm() { setEditingScheduleId(null); setShowSchedForm(true); }
 
-  function openSchedForm() {
-    setSchedModelId("");
-    setSchedTriggerMode("interval");
-    setSchedListenId("");
-    setShowSchedForm(true);
-  }
+  function editSchedule(schedule: Schedule) { setEditingScheduleId(schedule.id); setShowSchedForm(true); }
 
   function closeSchedForm() {
     setShowSchedForm(false);
@@ -1196,99 +1146,6 @@ export default function HomePage() {
     }
   }
 
-  function openShelf() {
-    setShelfDraftExpertId(expertId);
-    setShelfDraftSkillId(skillId);
-    setShelfQuery("");
-    setShowShelf(true);
-  }
-
-  function closeShelf() {
-    setShowShelf(false);
-    setShelfQuery("");
-  }
-
-  function clearShelfSelection() {
-    setExpertId("");
-    setSkillId("");
-    setShelfLocked(false);
-    setShelfDraftExpertId("");
-    setShelfDraftSkillId("");
-  }
-
-  function applyShelfChoice(nextSkillId: string, nextExpertId: string = "") {
-    const matchedScene = scenes.find((s) => s.skill_id === nextSkillId);
-    if (matchedScene) {
-      void applyScene(matchedScene);
-      if (nextExpertId) setExpertId(nextExpertId);
-    } else {
-      const skill = skills.find((s) => s.id === nextSkillId);
-      setSkillId(nextSkillId);
-      setExpertId(nextExpertId);
-      setActiveSceneId("");
-      setNeedsTableUpload(nextSkillId === "table_analysis");
-      setShelfLocked(true);
-      if (!prompt.trim() && skill) {
-        setPrompt(`请按「${skill.name}」帮我完成：……`);
-      }
-    }
-    closeShelf();
-  }
-
-  function confirmShelf() {
-    if (shelfTab === "experts") {
-      if (!shelfDraftExpertId) return;
-      const ex = experts.find((x) => x.id === shelfDraftExpertId);
-      const nextSkill = shelfDraftSkillId || ex?.default_skill_id || "";
-      if (!nextSkill) {
-        setExpertId(shelfDraftExpertId);
-        closeShelf();
-        return;
-      }
-      applyShelfChoice(nextSkill, shelfDraftExpertId);
-      return;
-    }
-    if (!shelfDraftSkillId) return;
-    applyShelfChoice(shelfDraftSkillId, "");
-  }
-
-  function pickExpertDraft(id: string) {
-    setShelfDraftExpertId(id);
-    const ex = experts.find((x) => x.id === id);
-    if (ex?.default_skill_id) setShelfDraftSkillId(ex.default_skill_id);
-  }
-
-  function pickSkillDraft(id: string) {
-    setShelfDraftSkillId(id);
-    setShelfDraftExpertId("");
-  }
-
-  useEffect(() => {
-    if (!showShelf) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeShelf();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [showShelf]);
-
-  const shelfQ = shelfQuery.trim().toLowerCase();
-  const matchShelf = (parts: Array<string | undefined>) => {
-    if (!shelfQ) return true;
-    return parts.some((p) => (p || "").toLowerCase().includes(shelfQ));
-  };
-  const filteredExperts = experts.filter((e) =>
-    matchShelf([e.name, e.description, e.strength, e.best_for, e.output_shape])
-  );
-  const filteredSkills = skills.filter((s) =>
-    matchShelf([s.name, s.description, s.strength, s.best_for, s.output_shape])
-  );
-  const shelfCanConfirm =
-    shelfTab === "experts" ? Boolean(shelfDraftExpertId) : Boolean(shelfDraftSkillId);
-  const shelfDraftLabel =
-    shelfTab === "experts"
-      ? experts.find((e) => e.id === shelfDraftExpertId)?.name
-      : skills.find((s) => s.id === shelfDraftSkillId)?.name;
   const sceneCategories = SCENE_CATEGORY_ORDER.filter((id) =>
     scenes.some((s) => (s.category || "writing") === id)
   );
@@ -1325,6 +1182,7 @@ export default function HomePage() {
     el.scrollBy({ top: dir * step, behavior: "smooth" });
   }
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Category and item count invalidate DOM geometry; the callback only reads the DOM ref.
   useEffect(() => {
     const el = sceneChildrenRef.current;
     if (el) el.scrollTop = 0;
@@ -1348,11 +1206,6 @@ export default function HomePage() {
     schedules: "自动化",
   };
 
-  const intervalPresets: { label: string; minutes: number }[] = [
-    { label: "每小时", minutes: 60 },
-    { label: "每天", minutes: 1440 },
-    { label: "每周", minutes: 10080 },
-  ];
 
   function formatInterval(minutes: number): string {
     if (minutes === 60) return "每小时";
@@ -1376,8 +1229,8 @@ export default function HomePage() {
     if (trigger === "task_done") return "任务成功后";
     if (trigger === "interval") return "到点";
     if (trigger === "manual") return "立即跑";
-    if (trigger === "webhook") return "Webhook";
-    return trigger || "—";
+    if (trigger === "webhook") return "外部触发";
+    return "其他方式";
   }
 
 
@@ -1391,151 +1244,9 @@ export default function HomePage() {
     })
     .sort(compareWorkspaceEntries);
 
-  const schedFormCard = (
-    <div className="panel-card mx-auto max-w-xl space-y-4 p-5">
-      <p className="text-sm text-[var(--muted)]">
-        选好触发方式：到点重复，或等另一条自动化成功后再跑本条。
-      </p>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <label className="text-sm text-[var(--muted)] sm:col-span-2">
-          名称
-          <input className="field" value={schedName} onChange={(e) => setSchedName(e.target.value)} />
-        </label>
-        <label className="text-sm text-[var(--muted)] sm:col-span-2">
-          自动执行内容
-          <textarea
-            className="field"
-            rows={3}
-            placeholder="例如：生成本周行业速览，并整理成可转发草稿……"
-            value={schedPrompt}
-            onChange={(e) => setSchedPrompt(e.target.value)}
-          />
-        </label>
-        <div className="text-sm text-[var(--muted)] sm:col-span-2">
-          <span>触发方式</span>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <button
-              type="button"
-              className={`btn-ghost !px-3 !py-1.5 text-xs ${
-                schedTriggerMode === "interval" ? "!border-[var(--accent)] !text-[var(--accent)]" : ""
-              }`}
-              onClick={() => setSchedTriggerMode("interval")}
-            >
-              到点重复
-            </button>
-            <button
-              type="button"
-              className={`btn-ghost !px-3 !py-1.5 text-xs ${
-                schedTriggerMode === "on_task_succeeded"
-                  ? "!border-[var(--accent)] !text-[var(--accent)]"
-                  : ""
-              }`}
-              onClick={() => setSchedTriggerMode("on_task_succeeded")}
-            >
-              某条成功后再跑
-            </button>
-          </div>
-          <p className="mt-2 text-xs text-[var(--faint)]">
-            {schedTriggerMode === "interval"
-              ? "按设定间隔自动开跑（与以前一样）。"
-              : "当选中的那条自动化跑成功后，自动再跑本条。不会连环触发（只跟一层）。"}
-          </p>
-        </div>
-        {schedTriggerMode === "interval" ? (
-          <div className="text-sm text-[var(--muted)] sm:col-span-2">
-            <span>多久跑一次</span>
-            <div className="mt-2 flex flex-wrap gap-2">
-              {intervalPresets.map((p) => (
-                <button
-                  key={p.minutes}
-                  type="button"
-                  className={`btn-ghost !px-3 !py-1.5 text-xs ${
-                    schedInterval === p.minutes ? "!border-[var(--accent)] !text-[var(--accent)]" : ""
-                  }`}
-                  onClick={() => setSchedInterval(p.minutes)}
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
-            <label className="mt-3 block">
-              自定义（分钟）
-              <input
-                type="number"
-                min={1}
-                className="field"
-                value={schedInterval}
-                onChange={(e) => setSchedInterval(Number(e.target.value))}
-              />
-            </label>
-          </div>
-        ) : (
-          <label className="text-sm text-[var(--muted)] sm:col-span-2">
-            监听哪条自动化（成功后触发本条）
-            <select
-              className="field"
-              value={schedListenId}
-              onChange={(e) => setSchedListenId(e.target.value)}
-            >
-              <option value="">请选择…</option>
-              {schedules.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
-            {schedules.length === 0 ? (
-              <span className="mt-1 block text-xs text-[var(--faint)]">
-                还没有可监听的自动化，请先建一条「到点重复」的上游。
-              </span>
-            ) : null}
-          </label>
-        )}
-        <label className="text-sm text-[var(--muted)]">
-          技能（可选）
-          <select className="field" value={schedSkillId} onChange={(e) => setSchedSkillId(e.target.value)}>
-            <option value="">通用调研</option>
-            {skills.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="text-sm text-[var(--muted)]">
-          <p className="mb-2">运行模型（必选）</p>
-          <ModelPicker value={schedModelId} onChange={setSchedModelId} disabled={busy} />
-        </div>
-        <label className="text-sm text-[var(--muted)]">
-          专家（可选）
-          <select className="field" value={schedExpertId} onChange={(e) => setSchedExpertId(e.target.value)}>
-            <option value="">不选专家</option>
-            {experts.map((e) => (
-              <option key={e.id} value={e.id}>
-                {e.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="flex flex-wrap gap-2 pt-1">
-        <button
-          className="btn-primary"
-          disabled={
-            busy ||
-            !schedPrompt.trim() ||
-            (schedTriggerMode === "on_task_succeeded" && !schedListenId)
-          }
-          onClick={onCreateSchedule}
-        >
-          创建自动化
-        </button>
-        <button className="btn-ghost" type="button" disabled={busy} onClick={closeSchedForm}>
-          取消
-        </button>
-      </div>
-    </div>
-  );
+  const schedFormCard = <ScheduleEditor key={editingScheduleId || "new"} initial={schedules.find(schedule => schedule.id === editingScheduleId)}
+    schedules={schedules} skills={[]} experts={[]} onClose={closeSchedForm}
+    onSaved={async () => { setShowSchedForm(false); setEditingScheduleId(null); await refreshSchedules(); }} />;
 
   return (
     <FusionShell panel={panel} title={selected?.title} tasks={tasks} onNavigate={navigatePanel}
@@ -1572,7 +1283,7 @@ export default function HomePage() {
           {error ? (
             <div className="alert-error mb-4 rounded-md px-4 py-3 text-sm">
               {error}
-              {error.includes("COST_CONFIRM_REQUIRED") && selected ? (
+              {errorCode === "COST_CONFIRM_REQUIRED" && selected ? (
                 <button className="ml-3 underline" onClick={() => onConfirm(true)}>
                   确认费用并继续
                 </button>
@@ -1586,140 +1297,13 @@ export default function HomePage() {
                 tasks={tasks} loading={taskLoading} schedules={schedules} scenes={scenes}
                 onScene={scene => { void applyScene(scene); }} onTask={id => { void selectTask(id); }} onNavigate={navigatePanel}
                 composer={{
-                  prompt, onPrompt: value => { setPrompt(value); setActiveSceneId(""); if (!pendingTableFiles.some(file => isTableFileName(file.name))) setShelfLocked(false); },
-                  modelId, onModel: setModelId, files: pendingTableFiles, refs: pendingWsTables,
-                  onFiles: files => {
-                    setPendingTableFiles(files);
-                    if (files.some(file => isTableFileName(file.name))) { setNeedsTableUpload(true); setSkillId("table_analysis"); setActiveSceneId("table_analysis"); setShelfLocked(true); }
-                  },
-                  onRemoveRef: path => setPendingWsTables(prev => prev.filter(item => item !== path)),
-                  urls, onUrls: setUrls, busy, onSubmit: () => { void onCreate(); }, onError: setError, onShelf: openShelf,
-                  choice: experts.find(expert => expert.id === expertId)?.name || skills.find(skill => skill.id === skillId)?.name || "",
+                  prompt, onPrompt: value => { setPrompt(value); setActiveSceneId(""); if (!hasTableMaterial(pendingTableFiles, pendingWsTables)) { setSceneLocked(false); setSkillId(""); setNeedsTableUpload(false); setDetectHint(null); } },
+                  files: pendingTableFiles, refs: pendingWsTables,
+                  onFiles: setPendingTableFiles,
+                  onRemoveRef: removeWorkspaceMaterial,
+                  urls, onUrls: setUrls, busy, onSubmit: () => { void onCreate(); }, onError: setError,
                 }}
               />
-              {showShelf && typeof document !== "undefined"
-                ? createPortal(
-                    <div className="shelf-overlay" role="dialog" aria-modal="true" aria-label="能力货架">
-                      <button
-                        type="button"
-                        className="shelf-overlay-backdrop"
-                        aria-label="关闭"
-                        onClick={closeShelf}
-                      />
-                      <div className="shelf-overlay-panel">
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div>
-                            <h2 className="font-display text-lg font-semibold text-[var(--ink)]">能力货架</h2>
-                            <p className="mt-1 text-xs text-[var(--muted)]">
-                              先点选专家或技能，再点「确定」带回新建页。
-                            </p>
-                          </div>
-                          <button type="button" className="btn-ghost !py-1.5 text-xs" onClick={closeShelf}>
-                            关闭
-                          </button>
-                        </div>
-                        <div className="mt-4 flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            className={shelfTab === "experts" ? "scene-pill scene-pill-active" : "scene-pill"}
-                            onClick={() => setShelfTab("experts")}
-                          >
-                            专家 · {filteredExperts.length === experts.length
-                              ? `共 ${experts.length}`
-                              : `筛选 ${filteredExperts.length}/${experts.length}`}
-                          </button>
-                          <button
-                            type="button"
-                            className={shelfTab === "skills" ? "scene-pill scene-pill-active" : "scene-pill"}
-                            onClick={() => setShelfTab("skills")}
-                          >
-                            技能 · {filteredSkills.length === skills.length
-                              ? `共 ${skills.length}`
-                              : `筛选 ${filteredSkills.length}/${skills.length}`}
-                          </button>
-                          <input
-                            className="field !mt-0 min-w-[12rem] flex-1 text-sm"
-                            placeholder="搜索名称、擅长、适合场景…"
-                            value={shelfQuery}
-                            onChange={(e) => setShelfQuery(e.target.value)}
-                          />
-                        </div>
-                        <div className="mt-4 grid max-h-[min(24rem,48vh)] gap-3 overflow-y-auto lg:grid-cols-2">
-                          {experts.length + skills.length === 0 ? (
-                            <p className="text-xs text-[var(--faint)] lg:col-span-2">
-                              货架还没加载到内容，请稍后重试或刷新页面。
-                            </p>
-                          ) : shelfTab === "experts" ? (
-                            filteredExperts.length === 0 ? (
-                              <p className="text-xs text-[var(--faint)] lg:col-span-2">没有匹配的专家</p>
-                            ) : (
-                              filteredExperts.map((e) => (
-                                <button
-                                  key={e.id}
-                                  type="button"
-                                  className={`shelf-card ${
-                                    shelfDraftExpertId === e.id ? "shelf-card-active" : ""
-                                  }`}
-                                  onClick={() => pickExpertDraft(e.id)}
-                                >
-                                  <span className="shelf-item-title">{e.name}</span>
-                                  <span className="shelf-meta">擅长：{e.strength || e.description}</span>
-                                  <span className="shelf-meta">适合：{e.best_for || "一般办公成稿"}</span>
-                                  <span className="shelf-meta">成品：{e.output_shape || "书面草稿"}</span>
-                                </button>
-                              ))
-                            )
-                          ) : filteredSkills.length === 0 ? (
-                            <p className="text-xs text-[var(--faint)] lg:col-span-2">没有匹配的技能</p>
-                          ) : (
-                            filteredSkills.map((s) => (
-                              <button
-                                key={s.id}
-                                type="button"
-                                className={`shelf-card ${
-                                  shelfDraftSkillId === s.id ? "shelf-card-active" : ""
-                                }`}
-                                onClick={() => pickSkillDraft(s.id)}
-                              >
-                                <span className="shelf-item-title">{s.name}</span>
-                                <span className="shelf-meta">擅长：{s.strength || s.description}</span>
-                                <span className="shelf-meta">适合：{s.best_for || "一般办公成稿"}</span>
-                                <span className="shelf-meta">成品：{s.output_shape || "书面草稿"}</span>
-                              </button>
-                            ))
-                          )}
-                        </div>
-                        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t soft-divider pt-4">
-                          <p className="text-xs text-[var(--muted)]">
-                            {shelfDraftLabel ? `已选：${shelfDraftLabel}` : "尚未选择"}
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              className="btn-text !py-1.5 text-xs"
-                              disabled={!expertId && !skillId && !shelfDraftExpertId && !shelfDraftSkillId}
-                              onClick={clearShelfSelection}
-                            >
-                              清除选择
-                            </button>
-                            <button type="button" className="btn-ghost !py-1.5 text-xs" onClick={closeShelf}>
-                              取消
-                            </button>
-                            <button
-                              type="button"
-                              className="btn-primary !py-1.5 text-xs"
-                              disabled={!shelfCanConfirm}
-                              onClick={confirmShelf}
-                            >
-                              确定
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    </div>,
-                    document.body
-                  )
-                : null}
             </>
           ) : null}
 
@@ -1877,7 +1461,6 @@ export default function HomePage() {
           {panel === "task" ? (
             selected ? (
               <div className="task-detail-stage mx-auto w-full max-w-3xl space-y-6">
-                <p className="text-xs text-[var(--muted)]">本次模型：{selected.model_label ? `${selected.model_label} · ${selected.model_name}` : "历史配置（创建时未记录型号）"}</p>
                 {!(report || selected.has_report) ? (
                   <div className="flex flex-wrap items-center gap-2 text-sm text-[var(--muted)]">
                     <span className="inline-flex items-center gap-1.5">
@@ -1989,8 +1572,7 @@ export default function HomePage() {
 
                 {selected.error_message ? (
                   <div className="alert-error rounded-md px-4 py-3 text-sm">
-                    {selected.error_code ? `${selected.error_code}: ` : ""}
-                    {selected.error_message}
+                    {userErrorMessage(selected.error_message)}
                   </div>
                 ) : null}
 
@@ -2089,8 +1671,8 @@ export default function HomePage() {
                       </div>
                     ) : null}
                     {selected.plan ? (
-                      <div className="mt-3">
-                        <h3 className="section-label mb-2">计划</h3>
+                      <details className="mt-3">
+                        <summary className="section-label mb-2 cursor-pointer">查看执行计划</summary>
                         <ol className="list-decimal space-y-1 pl-5 leading-relaxed">
                           {selected.plan.steps.map((s, i) => (
                             <li key={i}>
@@ -2099,7 +1681,7 @@ export default function HomePage() {
                             </li>
                           ))}
                         </ol>
-                      </div>
+                      </details>
                     ) : null}
                     {selected.steps?.length > 0 ? (
                       <div className="mt-3">
@@ -2108,12 +1690,15 @@ export default function HomePage() {
                           {selected.steps.map((s) => (
                             <li key={s.seq} className="flex items-center gap-2.5">
                               <span className={`status-dot ${statusTone(s.status)}`} />
-                              <span>
-                                #{s.seq} {s.name}
+                              <div>
+                                {s.name}
                                 <span className="ml-2 text-[11px]">{STATUS_LABEL[s.status] || s.status}</span>
-                                {s.detail?.evidence ? <span className="mt-1 block text-xs text-[var(--muted)]">{s.detail.evidence}</span> : null}
-                                {s.detail?.summary ? <span className="mt-1 block whitespace-pre-wrap text-xs text-[var(--muted)]">{s.detail.summary}</span> : null}
-                              </span>
+                                {s.detail?.evidence || s.detail?.summary ? <details className="mt-1 text-xs text-[var(--muted)]">
+                                  <summary className="cursor-pointer">查看过程依据</summary>
+                                  {s.detail.evidence ? <p className="mt-1">{s.detail.evidence}</p> : null}
+                                  {s.detail.summary ? <p className="mt-1 whitespace-pre-wrap">{s.detail.summary}</p> : null}
+                                </details> : null}
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -2142,7 +1727,7 @@ export default function HomePage() {
                             </span>
                           </div>
                           <p className="mt-1 text-[11px] text-[var(--faint)]">
-                            预览为 Markdown；主按钮跟随下方所选格式。
+                              选择格式，即可下载成果。
                           </p>
                         </div>
                         <button
@@ -2418,7 +2003,7 @@ export default function HomePage() {
                         ? wsFilter === "tables"
                           ? "没有表格。可上传 csv/xlsx，或切到「全部」。"
                           : "没有匹配的材料。"
-                        : "资料库暂不可用，请先在新任务中上传文件。"}
+                        : "资料库暂不可用，请联系管理员。可先在新任务中上传材料。"}
                     </li>
                   ) : null}
                 </ul>
@@ -2452,7 +2037,7 @@ export default function HomePage() {
                   <ul className="sched-notice-banner-list">
                     {unreadFailNotices.slice(0, 5).map((n) => (
                       <li key={n.run_id} className="sched-notice-banner-item">
-                        <span className="sched-notice-banner-text" title={n.error || ""}>
+                        <span className="sched-notice-banner-text" title={userErrorMessage(n.error || "")}>
                           {formatNoticeLine(n)}
                         </span>
                         {n.task_id ? (
@@ -2522,7 +2107,6 @@ export default function HomePage() {
                               <div className="mt-0.5 truncate text-xs text-[var(--faint)]" title={s.prompt}>
                                 {s.prompt}
                               </div>
-                              <div className="mt-1 text-xs text-[var(--muted)]">模型：{s.model_name || "历史配置"}</div>
                             </td>
                             <td className="whitespace-nowrap text-[var(--muted)]" title={formatTriggerMode(s)}>
                               {formatTriggerMode(s)}
@@ -2547,15 +2131,15 @@ export default function HomePage() {
                               {s.last_error ? (
                                 <div
                                   className="sched-last-error mt-1 text-xs leading-snug text-[var(--danger)]"
-                                  title={s.last_error}
+                                  title={userErrorMessage(s.last_error)}
                                 >
-                                  {s.last_error}
+                                  {userErrorMessage(s.last_error)}
                                 </div>
                               ) : null}
                             </td>
                             <td className="whitespace-nowrap">
                               <span className={s.enabled ? "text-[var(--accent)]" : "text-[var(--faint)]"}>
-                                {s.enabled ? "启用" : "停用"}
+                                {s.setup_required ? "设置待更新" : s.active_run_id ? "执行中" : s.enabled ? "启用" : "停用"}
                               </span>
                             </td>
                             <td>
@@ -2597,6 +2181,8 @@ export default function HomePage() {
                                 >
                                   立即跑
                                 </button>
+                                <button className="btn-ghost !px-2 !py-1 text-xs" disabled={busy || Boolean(s.active_run_id)}
+                                  onClick={() => editSchedule(s)}>{s.setup_required ? "重新保存" : "编辑"}</button>
                                 <button
                                   className="btn-ghost !px-2 !py-1 text-xs"
                                   disabled={busy || runsLoading}
@@ -2661,11 +2247,12 @@ export default function HomePage() {
                                                 : "sched-runs-fail"
                                             }
                                           >
-                                            {run.status === "success" ? "成功" : "失败"}
+                                            {runStatusLabel(run.status)}
                                           </span>
                                           <span className="text-xs text-[var(--faint)]">
                                             {formatRunTrigger(run.trigger)}
                                           </span>
+                                          {run.input_manifest?.files?.length ? <span className="text-xs text-[var(--muted)]">材料：{run.input_manifest.files.map(file => file.filename).join("、")}</span> : null}
                                           {run.task_id ? (
                                             <button
                                               className="text-xs text-[var(--accent)] underline-offset-2 hover:underline"
@@ -2677,8 +2264,8 @@ export default function HomePage() {
                                             <span className="text-xs text-[var(--faint)]">无任务</span>
                                           )}
                                           {run.error ? (
-                                            <span className="sched-runs-error" title={run.error}>
-                                              {run.error}
+                                            <span className="sched-runs-error" title={userErrorMessage(run.error)}>
+                                              {userErrorMessage(run.error)}
                                             </span>
                                           ) : (
                                             <span className="text-xs text-[var(--faint)]">—</span>
@@ -2751,7 +2338,7 @@ export default function HomePage() {
             <div className="sched-toast-title">
               {schedToast.status === "failed" ? "自动化失败" : "自动化完成"}
             </div>
-            <div className="sched-toast-text" title={schedToast.error || ""}>
+            <div className="sched-toast-text" title={userErrorMessage(schedToast.error || "")}>
               {formatNoticeLine(schedToast)}
             </div>
           </div>
